@@ -21,7 +21,7 @@ sudo pacman -S python-gobject webkit2gtk-4.1     # if they aren't there already
 
 **SimpleHome on every new tab.** Ctrl+T opens a tab with SimpleHome's clock, launcher, shortcuts, scratchpad, Drift and Horizon, with the cursor already in its search box. The page is served from `simplehome://home/`, so its shortcuts, theme and notes are saved and kept between restarts. Clicking a tile or pressing Enter in its search opens the site in that same tab, the way an address bar does. Ctrl-click or middle-click opens it in a new tab instead. Settings → Backup in SimpleHome can bring your shortcuts over from the Chrome extension.
 
-**Tabs.** You can drag tabs to reorder them, middle-click one to close it, and scroll the strip when it overflows. Your tabs come back the next time you open the browser (you can turn that off in the menu). Links from other apps, and a second launch, open as tabs in the window you used last.
+**Tabs.** Tabs sit in a column on the left, under the toolbar, with New tab at the top. Long titles get the room a row of tabs never has. To put them back in a row along the top, turn off "Tabs on the side" in the menu. You can drag tabs to reorder them, middle-click one to close it, and scroll the list when it overflows. Your tabs come back the next time you open the browser (you can turn that off in the menu). Links from other apps, and a second launch, open as tabs in the window you used last.
 
 **Address bar.** Type an address or a search. `localhost:3000`, IP addresses and `.local` hosts go over http; anything with a space, or without a domain, is searched. Suggestions come from the sites you've visited, ranked by how often and how recently. The address bar uses the same search engine as SimpleHome's search box: change one and the other follows. A lock shows when the connection is secure.
 
@@ -43,7 +43,7 @@ sudo pacman -S python-gobject webkit2gtk-4.1     # if they aren't there already
 | Ctrl+Shift+T | Reopen the last closed tab |
 | Ctrl+Tab, Ctrl+PgDn / Ctrl+Shift+Tab, Ctrl+PgUp | Next / previous tab |
 | Ctrl+1…8, Ctrl+9 | Go to tab 1…8, last tab |
-| Ctrl+Shift+PgUp / PgDn | Move the tab left / right |
+| Ctrl+Shift+PgUp / PgDn | Move the tab up / down (left / right in a row) |
 | Ctrl+L, Alt+D, F6 | Address bar |
 | Ctrl+R, F5 / Ctrl+Shift+R | Reload / reload without the cache |
 | Alt+Left / Alt+Right, mouse back/forward | Back / forward |

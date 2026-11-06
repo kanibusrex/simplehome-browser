@@ -27,7 +27,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import adblock  # noqa: E402
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 APP_ID = "dev.simplehome.Browser"
 NAME = "SimpleHome Browser"
 DESKTOP_ID = "simplehome-browser.desktop"
@@ -383,6 +383,10 @@ BASE_CSS = """
 .sh-tabs > header tab button { padding: 0; min-height: 18px; min-width: 18px; }
 .sh-tabs stack { min-height: 0; }
 .sh-tabs { border: none; }
+.sh-tabs.sh-side > header { padding: 6px 4px 6px 6px; }
+.sh-tabs.sh-side > header tab { padding: 6px 6px 6px 10px; margin: 1px 0; min-height: 24px; }
+.sh-tabs.sh-side stack { min-width: 0; }
+.sh-newtab { padding: 6px 10px; margin-bottom: 4px; }
 .sh-bar { padding: 4px 6px 6px 6px; }
 .sh-bar button { padding: 4px 6px; min-height: 22px; }
 .sh-url { min-height: 30px; padding-left: 10px; border-radius: 8px; }
@@ -418,13 +422,18 @@ def theme_css(p, private=False):
 .sh-tabs > header tab {{ background: transparent; color: @sh_muted; border: none; border-radius: 8px 8px 0 0; box-shadow: none; }}
 .sh-tabs > header tab:hover {{ background: @sh_surface; color: @sh_fg; }}
 .sh-tabs > header tab:checked {{ background: @sh_surface; color: @sh_fg; box-shadow: inset 0 2px @sh_acc; }}
+.sh-tabs.sh-side > header {{ box-shadow: inset -1px 0 @sh_border; }}
+.sh-tabs.sh-side > header tab {{ border-radius: 8px; }}
+.sh-tabs.sh-side > header tab:checked {{ box-shadow: inset 3px 0 @sh_acc; }}
+.sh-newtab, .sh-newtab label {{ color: @sh_muted; }}
+.sh-newtab:hover, .sh-newtab:hover label {{ color: @sh_fg; }}
 .sh-tabs > header tab label {{ color: inherit; }}
 .sh-tabs > header button, .sh-bar button, .sh-find button {{ background: transparent; color: @sh_fg; border: none; box-shadow: none; text-shadow: none; -gtk-icon-shadow: none; }}
 .sh-tabs > header button:hover, .sh-bar button:hover, .sh-find button:hover {{ background: @sh_raised; }}
 .sh-bar button:checked {{ background: @sh_raised; color: @sh_acc; }}
 .sh-bar button:disabled {{ color: alpha(@sh_fg, 0.3); }}
 .sh-bar {{ background: @sh_surface; }}
-.sh-window entry {{ background: @sh_bg; color: @sh_fg; border: 1px solid @sh_border; box-shadow: none; caret-color: @sh_acc; }}
+.sh-window entry {{ {font} background: @sh_bg; color: @sh_fg; border: 1px solid @sh_border; box-shadow: none; caret-color: @sh_acc; }}
 .sh-window entry:focus {{ border-color: @sh_acc; }}
 .sh-window entry selection {{ background: @sh_acc; color: @sh_bg; }}
 .sh-window entry image {{ color: @sh_muted; }}
@@ -452,8 +461,7 @@ class Tab:
         # the notebook only draws the tab strip; the page itself lives in the window's stack
         self.slot = Gtk.Box()
         self.label = Gtk.Label(label=self.title, ellipsize=Pango.EllipsizeMode.END, xalign=0)
-        self.label.set_width_chars(16)
-        self.label.set_max_width_chars(22)
+        self.set_vertical(win.app.prefs.data.get("vertical_tabs", True))
         self.icon = Gtk.Image.new_from_icon_name("web-browser-symbolic", Gtk.IconSize.MENU)
         self.spinner = Gtk.Spinner()
         self.lead = Gtk.Stack()
@@ -499,6 +507,11 @@ class Tab:
     @property
     def uri(self):
         return self.view.get_uri() or ""
+
+    def set_vertical(self, vertical):
+        # a side column is as wide as its widest tab, so every tab gets the same fixed width there
+        self.label.set_width_chars(22 if vertical else 16)
+        self.label.set_max_width_chars(22)
 
     def on_head_press(self, w, ev):
         if ev.button == 2:
@@ -661,6 +674,13 @@ class Tab:
 
     def on_crash(self, view, reason):
         uri = self.uri
+        log("web process ended", uri, reason)
+        # a one-off: load it again by itself; a page that keeps dying gets the message instead
+        now = time.time()
+        if reason != WebKit2.WebProcessTerminationReason.EXCEEDED_MEMORY_LIMIT and now - getattr(self, "_crashed_at", 0) > 60:
+            self._crashed_at = now
+            GLib.idle_add(lambda: view.load_uri(uri) and False)
+            return
         why = "ran out of memory" if reason == WebKit2.WebProcessTerminationReason.EXCEEDED_MEMORY_LIMIT else "stopped"
         html = (f"<!doctype html><meta charset=utf-8><title>Page {why}</title><body style='font:16px system-ui;"
                 f"padding:15vh 10vw;color:#999;background:#111'><h2>This page {why}.</h2>"
@@ -691,12 +711,21 @@ class Window(Gtk.ApplicationWindow):
         self.notebook.set_vexpand(False)
         self.notebook.connect("switch-page", self.on_switch)
         self.notebook.connect("page-reordered", lambda *_: self.save_session())
-        add = Gtk.Button.new_from_icon_name("list-add-symbolic", Gtk.IconSize.MENU)
-        add.set_relief(Gtk.ReliefStyle.NONE)
-        add.set_tooltip_text("New tab (Ctrl+T)")
-        add.connect("clicked", lambda *_: self.new_tab())
-        add.show()
-        self.notebook.set_action_widget(add, Gtk.PackType.END)
+        # "+" sits after the tabs in a row, and at the top of the column when tabs are on the side
+        self.add_btns = {}
+        for pack in (Gtk.PackType.START, Gtk.PackType.END):
+            add = Gtk.Button.new_from_icon_name("list-add-symbolic", Gtk.IconSize.MENU)
+            add.set_relief(Gtk.ReliefStyle.NONE)
+            add.set_tooltip_text("New tab (Ctrl+T)")
+            add.connect("clicked", lambda *_: self.new_tab())
+            if pack == Gtk.PackType.START:
+                add.set_always_show_image(True)
+                add.set_label("New tab")
+                add.get_style_context().add_class("sh-newtab")
+                add.get_child().set_halign(Gtk.Align.START)
+            add.set_no_show_all(True)
+            self.notebook.set_action_widget(add, pack)
+            self.add_btns[pack] = add
 
         self.stack = Gtk.Stack()
         self.stack.set_vexpand(True)
@@ -714,23 +743,52 @@ class Window(Gtk.ApplicationWindow):
         sbox.set_no_show_all(True)
         self.status.show()
         self.status_rev = sbox
-        overlay = Gtk.Overlay()
-        overlay.add(self.stack)
-        overlay.add_overlay(self.status_rev)
-        overlay.set_overlay_pass_through(self.status_rev, True)
+        self.overlay = Gtk.Overlay()
+        self.overlay.add(self.stack)
+        self.overlay.add_overlay(self.status_rev)
+        self.overlay.set_overlay_pass_through(self.status_rev, True)
 
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        box.pack_start(self.notebook, False, False, 0)
-        box.pack_start(self.bar, False, False, 0)
-        box.pack_start(overlay, True, True, 0)
-        box.pack_start(self.findbar, False, False, 0)
-        self.add(box)
+        self.vertical = None
+        self.layout(app.prefs.data.get("vertical_tabs", True))
         self.connect("key-press-event", self.on_key)
         self.connect("delete-event", self.on_delete)
         self.connect("notify::is-active", lambda *_: self.is_active() and app.focused(self))
         self.app.blocker.listeners.append(self.update_shield)
-        box.show_all()
         self.findbar.set_reveal_child(False)
+
+    def layout(self, vertical):
+        """Tabs on the side (a column left of the page, under the toolbar) or in a row on top.
+        Only the tab strip moves: GTK 3 entries keep a stale font after being re-parented."""
+        if vertical == self.vertical:
+            return
+        self.vertical = vertical
+        if self.get_child() is None:
+            self.top_slot = Gtk.Box()
+            self.side_slot = Gtk.Box()
+            body = Gtk.Box()
+            body.pack_start(self.side_slot, False, False, 0)
+            body.pack_start(self.overlay, True, True, 0)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            box.pack_start(self.top_slot, False, False, 0)
+            box.pack_start(self.bar, False, False, 0)
+            box.pack_start(body, True, True, 0)
+            box.pack_start(self.findbar, False, False, 0)
+            self.add(box)
+            box.show_all()
+        nb = self.notebook
+        if nb.get_parent():
+            nb.get_parent().remove(nb)
+        nb.set_tab_pos(Gtk.PositionType.LEFT if vertical else Gtk.PositionType.TOP)
+        ctx = nb.get_style_context()
+        (ctx.add_class if vertical else ctx.remove_class)("sh-side")
+        self.add_btns[Gtk.PackType.START].set_visible(vertical)
+        self.add_btns[Gtk.PackType.END].set_visible(not vertical)
+        for t in self.tabs:
+            t.set_vertical(vertical)
+        (self.side_slot if vertical else self.top_slot).pack_start(nb, True, True, 0)
+        nb.show()
+        if self.page_fullscreen:
+            nb.hide()
 
     # -- toolbar
     def build_bar(self):
@@ -1619,6 +1677,9 @@ class App(Gtk.Application):
                                                            GLib.Variant("s", self.prefs.data.get("engine", "google")))
         self.engine_action.connect("activate", self.on_engine)
         self.add_action(self.engine_action)
+        side = Gio.SimpleAction.new_stateful("vertical-tabs", None, GLib.Variant("b", self.prefs.data.get("vertical_tabs", True)))
+        side.connect("activate", self.on_vertical_tabs)
+        self.add_action(side)
         restore = Gio.SimpleAction.new_stateful("restore", None, GLib.Variant("b", self.prefs.data.get("restore", True)))
         restore.connect("activate", self.on_restore)
         self.add_action(restore)
@@ -1645,6 +1706,7 @@ class App(Gtk.Application):
         for k, (label, _) in ENGINES.items():
             eng.append(label, f"app.engine::{k}")
         s3.append_submenu("Address bar searches with", eng)
+        s3.append("Tabs on the side", "app.vertical-tabs")
         s3.append("Reopen last session's tabs", "app.restore")
         s3.append("Clear history…", "app.clear-history")
         s3.append("Clear cookies and site data…", "app.clear-data")
@@ -1670,6 +1732,14 @@ class App(Gtk.Application):
                         f"localStorage.setItem('homepage.engine', {json.dumps(url)});"
                         f"var s=document.getElementById('engineSelect'); if (s) s.value={json.dumps(url)};",
                         -1, None, None, None, None)
+
+    def on_vertical_tabs(self, a, _v):
+        on = not a.get_state().get_boolean()
+        a.set_state(GLib.Variant("b", on))
+        self.prefs.data["vertical_tabs"] = on
+        self.prefs.changed()
+        for w in self.windows():
+            w.layout(on)
 
     def on_restore(self, a, _v):
         on = not a.get_state().get_boolean()
