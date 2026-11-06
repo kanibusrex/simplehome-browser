@@ -14,6 +14,7 @@ home/           SimpleHome's index.html, bundled as the new tab page (home/SOURC
 
 ```sh
 sudo pacman -S python-gobject webkit2gtk-4.1     # if they aren't there already
+sudo pacman -S gst-plugin-va                     # video decoded by the graphics chip instead of the CPU
 ./install.sh SimpleHome-Browser-x86_64.AppImage  # add --default to make it the default browser
 ```
 
@@ -22,6 +23,8 @@ sudo pacman -S python-gobject webkit2gtk-4.1     # if they aren't there already
 ## What it does
 
 **SimpleHome on every new tab.** Ctrl+T opens a tab with SimpleHome's clock, launcher, shortcuts, scratchpad, Drift and Horizon, with the cursor already in its search box. The page is served from `simplehome://home/`, so its shortcuts, theme and notes are saved and kept between restarts. Clicking a tile or pressing Enter in its search opens the site in that same tab, the way an address bar does. Ctrl-click or middle-click opens it in a new tab instead. Settings → Backup in SimpleHome can bring your shortcuts over from the Chrome extension.
+
+**Fast starts.** Restored tabs wait to load until you open them, so only the one in front loads at startup.
 
 **Tabs.** Tabs sit in a column on the left, under the toolbar, with New tab at the top. Long titles get the room a row of tabs never has. To put them back in a row along the top, turn off "Tabs on the side" in the menu. You can drag tabs to reorder them, middle-click one to close it, and scroll the list when it overflows. Your tabs come back the next time you open the browser (you can turn that off in the menu). Links from other apps, and a second launch, open as tabs in the window you used last.
 
@@ -76,6 +79,7 @@ SimpleHome's own keys still work on the new tab page: Alt+1–9 opens a tile, an
 
 ## Limits
 
+- **Video needs `gst-plugin-va`.** Without it, WebKit decodes video on the CPU, which on a low-power machine is slow and makes everything else slow while a video plays. With it, H.264, VP9 and HEVC are decoded by Intel and AMD graphics chips through VA-API.
 - **No DRM.** WebKitGTK has no Widevine, so Netflix, Disney+ and Spotify's web player won't play.
 - **Site compatibility.** WebKit is Safari's engine, so a site that only tests in Chrome sometimes has rough edges.
 - **No extensions.** Chrome extensions don't run here. 1Password is built in instead (see above).

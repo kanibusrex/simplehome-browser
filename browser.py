@@ -28,7 +28,7 @@ sys.path.insert(0, HERE)
 import adblock  # noqa: E402
 import passwords  # noqa: E402
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 APP_ID = "dev.simplehome.Browser"
 NAME = "SimpleHome Browser"
 DESKTOP_ID = "simplehome-browser.desktop"
@@ -463,6 +463,7 @@ class Tab:
         self.win = win
         self.view = view
         self.private = win.private
+        self.pending = None  # a restored tab's address, loaded the first time the tab is shown
         self.title = "New tab"
         self.zoom_set = False
         # the notebook only draws the tab strip; the page itself lives in the window's stack
@@ -513,7 +514,7 @@ class Tab:
 
     @property
     def uri(self):
-        return self.view.get_uri() or ""
+        return self.view.get_uri() or self.pending or ""
 
     def set_vertical(self, vertical):
         # a side column is as wide as its widest tab, so every tab gets the same fixed width there
@@ -1037,7 +1038,7 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
     def view(self):
         return self.current.view if self.current else None
 
-    def new_tab(self, uri=HOME_URI, related=None, background=False, index=None):
+    def new_tab(self, uri=HOME_URI, related=None, background=False, index=None, lazy=False):
         app = self.app
         ucm = WebKit2.UserContentManager()
         if related is not None:
@@ -1053,7 +1054,14 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
             index = self.notebook.page_num(self.current.slot) + 1 if self.current else -1
         self.notebook.insert_page(tab.slot, tab.head, index)
         self.notebook.set_tab_reorderable(tab.slot, True)
-        if uri:
+        if uri and lazy:
+            # restored from the last session: only the tab in front loads now, the rest when opened
+            tab.pending = uri
+            h = app.history.by_url.get(uri, {})
+            tab.title = h.get("ti") or ("New tab" if uri.startswith(HOME_URI) else host_of(uri) or uri)
+            tab.label.set_text(tab.title)
+            tab.head.set_tooltip_text(tab.title)
+        elif uri:
             app.blocker.apply_to(ucm, uri)
             view.load_uri(uri)
         if not background or self.current is None:
@@ -1073,6 +1081,8 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
             return
         self.current = tab
         self.stack.set_visible_child(tab.view)
+        if tab.pending and not getattr(self, "restoring", False):
+            self.load_pending(tab)
         self.editing = False
         self.show_uri()
         self.tab_changed(tab, load=True, progress=True)
@@ -1081,6 +1091,11 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
             self.find(self.find_entry.get_text())
         if not self.url.has_focus():
             tab.view.grab_focus()
+
+    def load_pending(self, tab):
+        uri, tab.pending = tab.pending, None
+        self.app.blocker.apply_to(tab.view.get_user_content_manager(), uri)
+        tab.view.load_uri(uri)
 
     def close_tab(self, tab):
         if tab not in self.tabs:
@@ -1918,10 +1933,14 @@ class App(Gtk.Application):
     def new_window(self, uris=None, private=False, restore=None):
         w = Window(self, private=private)
         if restore:
+            w.restoring = True
             for u in restore.get("tabs", []):
-                w.new_tab(u, background=True)
+                w.new_tab(u, background=True, lazy=True)
             if w.tabs:
                 w.notebook.set_current_page(min(restore.get("active", 0), len(w.tabs) - 1))
+            w.restoring = False
+            if w.current and w.current.pending:
+                w.load_pending(w.current)
         for u in uris or []:
             w.new_tab(self.resolve(u))
         if not w.tabs:
