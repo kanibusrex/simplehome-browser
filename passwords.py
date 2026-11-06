@@ -8,6 +8,7 @@ wrap them; they still see the filled fields, as they would if the person had typ
 """
 
 import json
+import os
 import threading
 import time
 
@@ -105,7 +106,9 @@ WATCH_JS = r"""
 class Passwords:
     def __init__(self, app):
         self.app = app
-        self.op = onepassword.OnePassword(account=app.prefs.data.get("op_account") or None)
+        cache = os.environ.get("SIMPLEHOME_CACHE") or os.path.join(GLib.get_user_cache_dir(), "simplehome-browser")
+        self.op = onepassword.OnePassword(account=app.prefs.data.get("op_account") or None,
+                                          log=os.path.join(cache, "1password.log"))
         self.users = {}  # host -> (username, when): the first step of a two-step sign-in
 
     @property

@@ -28,7 +28,7 @@ sys.path.insert(0, HERE)
 import adblock  # noqa: E402
 import passwords  # noqa: E402
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 APP_ID = "dev.simplehome.Browser"
 NAME = "SimpleHome Browser"
 DESKTOP_ID = "simplehome-browser.desktop"
@@ -1633,6 +1633,11 @@ class App(Gtk.Application):
             self.theme_mon = Gio.File.new_for_path(OMARCHY_STATE).monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, None)
             self.theme_mon.connect("changed", self.on_theme_files)
         self.blocker.start()
+        if os.environ.get("SIMPLEHOME_SELFTEST_1P"):
+            # diagnostics: ask 1Password for the list once, as Ctrl+Shift+L would; the result goes
+            # to 1password.log in the cache folder (titles and secrets never do)
+            GLib.timeout_add_seconds(5, lambda: self.passwords.worker(
+                lambda: len(self.passwords.op.logins(refresh=True)), lambda n, e: log("selftest", n, e)) and False)
 
     def read_home(self):
         for p in (os.path.join(HERE, "home", "index.html"), os.path.join(HERE, "index.html")):
@@ -1990,6 +1995,21 @@ class App(Gtk.Application):
         Gtk.Application.do_shutdown(self)
 
 
+def lead_own_session():
+    """Become the leader of a new session when the one we were started in has lost its leader.
+
+    App launchers (gtk-launch, for one) start the browser and exit, leaving it in a session whose
+    leader no longer exists. 1Password's op describes its caller by walking up to that leader, and
+    the 1Password app refuses the description ("connecting to desktop app: connection reset";
+    InvalidClientInfo in its log). Started from a terminal, the shell is still the leader, so
+    nothing changes there."""
+    try:
+        if not os.path.exists(f"/proc/{os.getsid(0)}"):
+            os.setsid()
+    except OSError:
+        pass  # already a process-group leader: setsid isn't possible, and isn't needed
+
+
 def main():
     if "--version" in sys.argv[1:]:
         print(f"{NAME} {VERSION}")
@@ -1999,6 +2019,7 @@ def main():
         print(f"Usage: simplehome-browser [--new-window] [--private-window | --incognito] [URL…]\n\n{NAME} {VERSION}")
         return 0
     GLib.set_prgname(APP_ID)
+    lead_own_session()
     app = App()
     if os.environ.get("SIMPLEHOME_APP_ID"):  # a test instance beside the real one
         app.set_application_id(os.environ["SIMPLEHOME_APP_ID"])

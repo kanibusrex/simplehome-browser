@@ -39,6 +39,8 @@ That prompt names whichever program is asking. The browser runs on Python, so th
 - **How it fills:** the fill and save scripts run in their own JavaScript world, so the page's scripts can't intercept them. Passwords are given to `op` on its standard input, never on its command line, and a login waiting to be saved is held in memory for two minutes at most.
 - **More than one account:** if you're signed in to several 1Password accounts, set `"op_account"` in `prefs.json` to the one to use.
 
+If filling fails, `~/.cache/simplehome-browser/1password.log` records each call to `op` (when, which command, how it ended, and which programs started the browser). It never records titles, usernames or passwords. Starting the browser with `SIMPLEHOME_SELFTEST_1P=1` asks for the login list once, 5 seconds after starting, and logs the result there.
+
 Both parts can be turned off in the menu under 1Password. Passkeys, cards and addresses aren't filled.
 
 **Private windows.** Ctrl+Shift+N opens a window that keeps nothing: no history, no cookies, no site data, no saved permissions.

@@ -96,10 +96,29 @@ def is_local(host):
             or bool(re.match(r"^(10|127)\.|^192\.168\.|^172\.(1[6-9]|2\d|3[01])\.", host)))
 
 
+def process_chain(pid=None):
+    """'pid exe' for this process and its parents up to init: what 1Password looks at."""
+    out, pid = [], pid or os.getpid()
+    while pid and pid > 1 and len(out) < 12:
+        try:
+            exe = os.readlink(f"/proc/{pid}/exe")
+        except OSError as e:
+            exe = f"? ({e.strerror})"
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            ppid = 0
+        out.append(f"{pid} {exe}")
+        pid = ppid
+    return " <- ".join(out)
+
+
 class OnePassword:
-    def __init__(self, exe=None, account=None):
+    def __init__(self, exe=None, account=None, log=None):
         self.exe = exe or os.environ.get("SIMPLEHOME_OP") or shutil.which("op")
         self.account = account
+        self.log_path = log  # each op call: when, which command, how it ended; never values
         self._logins = None
         self._logins_at = 0
 
@@ -116,18 +135,38 @@ class OnePassword:
             raise OPError("The 1Password command-line tool (op) isn't installed:  sudo pacman -S 1password-cli", "missing")
         cmd = [self.exe] + args + (["--account", self.account] if self.account else [])
         env = dict(os.environ, OP_FORMAT="json")
+        started = time.time()
         try:
             r = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=timeout, env=env)
         except subprocess.TimeoutExpired:
+            self.note(args, started, "timeout", "")
             raise OPError("1Password took too long to answer.", "cancelled")
         except OSError as e:
+            self.note(args, started, "oserror", str(e))
             raise OPError(str(e), "missing")
+        self.note(args, started, r.returncode, (r.stderr or "").strip().splitlines()[0] if r.returncode else "")
         if r.returncode != 0:
             err = r.stderr or r.stdout
             if "timed out" in err.lower() and not _retried:
                 return self.run(args, stdin, timeout, _retried=True)  # a busy machine: once more
             raise OPError(*friendly(err), raw=raw_error(err))
         return r.stdout
+
+    def note(self, args, started, result, err):
+        if not self.log_path:
+            return
+        try:
+            if os.path.exists(self.log_path) and os.path.getsize(self.log_path) > 200_000:
+                os.replace(self.log_path, self.log_path + ".old")
+            first = not os.path.exists(self.log_path) or not getattr(self, "_chain_noted", False)
+            with open(self.log_path, "a") as f:
+                if first:
+                    f.write(time.strftime("%F %T") + " process: " + process_chain() + "\n")
+                    self._chain_noted = True
+                what = " ".join(a for a in args[:2])  # 'item list', 'item get': never ids or values
+                f.write(f"{time.strftime('%F %T')} op {what}: {result} after {time.time() - started:.1f}s {err}\n")
+        except OSError:
+            pass
 
     def logins(self, refresh=False):
         """Every Login item as {id, title, username, urls, vault}. May show 1Password's unlock prompt."""
