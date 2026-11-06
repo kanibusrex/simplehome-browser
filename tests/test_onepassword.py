@@ -44,6 +44,11 @@ class Errors(unittest.TestCase):
     def test_friendly(self):
         self.assertEqual(op.friendly("[ERROR] 2026/11/06 No accounts configured for use with 1Password CLI.")[1], "setup")
         self.assertEqual(op.friendly("[ERROR] 2026/11/06 authorization prompt dismissed, please try again")[1], "cancelled")
+        timeout = ("[ERROR] 2026/11/06 17:20:01 connecting to desktop app timed out, make sure it is "
+                   "installed, running and CLI integration is enabled")
+        self.assertEqual(op.friendly(timeout)[1], "retry")  # not "turn the integration on"
+        self.assertTrue(op.raw_error(timeout).startswith("connecting to desktop app timed out"))
+        self.assertEqual(op.friendly("[ERROR] x y connecting to desktop app: broken pipe")[1], "retry")
         msg, kind = op.friendly("[ERROR] 2026/11/06 17:00:00 something odd happened")
         self.assertEqual((msg, kind), ("something odd happened", "other"))
 

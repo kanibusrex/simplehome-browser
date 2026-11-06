@@ -28,7 +28,7 @@ sys.path.insert(0, HERE)
 import adblock  # noqa: E402
 import passwords  # noqa: E402
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 APP_ID = "dev.simplehome.Browser"
 NAME = "SimpleHome Browser"
 DESKTOP_ID = "simplehome-browser.desktop"

@@ -326,7 +326,9 @@ class PasswordUI:
             self.pw_close()
             self.toast(str(err))
             return
-        self.pw_message(str(err), action=("Try again", lambda: self.app.passwords.fill(self)) if err.kind == "setup" else None)
+        detail = err.raw if err.raw and err.raw != str(err) else None
+        again = ("Try again", lambda: self.app.passwords.fill(self)) if err.kind in ("setup", "retry", "other") else None
+        self.pw_message(str(err), detail=detail, action=again)
 
     def pw_choose(self, items, pick):
         self.pw_clear()

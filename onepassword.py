@@ -20,28 +20,43 @@ LIST_TTL = 300  # seconds a list of logins (titles, usernames, websites: no secr
 
 
 class OPError(Exception):
-    """kind: missing | setup | cancelled | other"""
+    """kind: missing | setup | retry | cancelled | other; raw: op's own words"""
 
-    def __init__(self, message, kind="other"):
+    def __init__(self, message, kind="other", raw=""):
         super().__init__(message)
         self.kind = kind
+        self.raw = raw
 
 
 def friendly(stderr):
-    """`op`'s error output -> (message for a person, kind)."""
+    """`op`'s error output -> (message for a person, kind). kind: setup | retry | cancelled | other."""
     s = (stderr or "").strip()
     low = s.lower()
-    if any(k in low for k in ("no accounts configured", "not currently signed in", "account is not signed in",
-                              "connecting to desktop app", "desktop app integration", "cannot connect to 1password",
-                              "couldn't connect to the 1password", "no account found")):
-        return ("1Password isn't connected yet. In the 1Password app, turn on Settings → Developer → "
-                "Integrate with 1Password CLI, then try again.", "setup")
+    # first: a slow answer. op words its timeout like the integration being off ("connecting to
+    # desktop app timed out, make sure it is installed, running and CLI integration is enabled"),
+    # which it usually isn't: the app was busy, or the machine was
+    if "timed out" in low or "timeout" in low and "authorization" not in low:
+        return ("1Password didn't answer in time. Make sure the 1Password app is open (unlock it if "
+                "it's locked), then try again.", "retry")
     if "dismiss" in low or "cancel" in low or "authorization timeout" in low or "user did not" in low:
         return ("1Password stayed locked.", "cancelled")
+    if ("no accounts configured" in low or "turn on the 1password desktop app integration" in low
+            or "desktop app integration" in low):
+        return ("1Password isn't connected yet. In the 1Password app, turn on Settings → Developer → "
+                "Integrate with 1Password CLI, then try again.", "setup")
+    if ("connecting to desktop app" in low or "cannot connect to 1password" in low
+            or "not currently signed in" in low or "account is not signed in" in low):
+        return ("Couldn't reach the 1Password app. Make sure it's open and signed in, then try again.", "retry")
     if "multiple accounts" in low:
         return ("More than one 1Password account is signed in. Set \"op_account\" in prefs.json to the one to use.", "setup")
     first = re.sub(r"^\[ERROR\]\s*\S+\s+\S+\s*", "", s.splitlines()[0]) if s else "1Password didn't answer."
     return (first, "other")
+
+
+def raw_error(stderr):
+    """op's own words, without its '[ERROR] date time' prefix, shown under the friendly message."""
+    s = (stderr or "").strip()
+    return re.sub(r"^\[ERROR\]\s*\S+\s+\S+\s*", "", s.splitlines()[0]) if s else ""
 
 
 def host_of(url):
@@ -92,7 +107,7 @@ class OnePassword:
     def has_list(self):
         return self._logins is not None
 
-    def run(self, args, stdin=None, timeout=120):
+    def run(self, args, stdin=None, timeout=120, _retried=False):
         if not self.exe:
             raise OPError("The 1Password command-line tool (op) isn't installed:  sudo pacman -S 1password-cli", "missing")
         cmd = [self.exe] + args + (["--account", self.account] if self.account else [])
@@ -104,7 +119,10 @@ class OnePassword:
         except OSError as e:
             raise OPError(str(e), "missing")
         if r.returncode != 0:
-            raise OPError(*friendly(r.stderr or r.stdout))
+            err = r.stderr or r.stdout
+            if "timed out" in err.lower() and not _retried:
+                return self.run(args, stdin, timeout, _retried=True)  # a busy machine: once more
+            raise OPError(*friendly(err), raw=raw_error(err))
         return r.stdout
 
     def logins(self, refresh=False):
