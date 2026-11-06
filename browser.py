@@ -28,7 +28,7 @@ sys.path.insert(0, HERE)
 import adblock  # noqa: E402
 import passwords  # noqa: E402
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 APP_ID = "dev.simplehome.Browser"
 NAME = "SimpleHome Browser"
 DESKTOP_ID = "simplehome-browser.desktop"
@@ -392,7 +392,10 @@ BASE_CSS = """
 .sh-chrome { box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35); }
 .sh-bar { padding: 4px 6px 6px 6px; }
 .sh-bar button { padding: 4px 6px; min-height: 22px; }
-.sh-url { min-height: 30px; padding-left: 10px; border-radius: 8px; }
+.sh-url { min-height: 30px; padding-left: 10px; }
+.sh-urlbox { border-radius: 8px; }
+.sh-urlbox entry { border-radius: 8px 0 0 8px; border-right: none; }
+.sh-urlbox button.sh-copy { border-radius: 0 8px 8px 0; padding: 0 9px; min-height: 30px; min-width: 0; }
 .sh-find { padding: 4px 8px; }
 .sh-zoom { padding: 2px 8px; font-size: 90%; }
 .sh-status { padding: 3px 8px; margin: 0 0 4px 4px; border-radius: 6px; font-size: 90%; }
@@ -443,6 +446,9 @@ def theme_css(p, private=False):
 .sh-bar {{ background: @sh_surface; }}
 .sh-window entry {{ {font} background: @sh_bg; color: @sh_fg; border: 1px solid @sh_border; box-shadow: none; caret-color: @sh_acc; }}
 .sh-window entry:focus {{ border-color: @sh_acc; }}
+.sh-window .sh-urlbox button.sh-copy {{ background: @sh_bg; color: @sh_muted; border: 1px solid @sh_border; border-left: none; box-shadow: none; }}
+.sh-window .sh-urlbox button.sh-copy:hover {{ color: @sh_fg; background: @sh_raised; }}
+.sh-window .sh-urlbox.sh-focus button.sh-copy {{ border-color: @sh_acc; }}
 .sh-window entry selection {{ background: @sh_acc; color: @sh_bg; }}
 .sh-window entry image {{ color: @sh_muted; }}
 .sh-window entry progress {{ border: none; border-bottom: 2px solid @sh_acc; background: none; }}
@@ -649,6 +655,13 @@ class Tab:
         return False
 
     def on_context_menu(self, view, menu, event, hit):
+        page = self.display_uri()
+        if page:
+            act = Gio.SimpleAction.new("copy-page-address", None)
+            act.connect("activate", lambda *_: self.win.copy_address())
+            if menu.get_n_items():
+                menu.append(WebKit2.ContextMenuItem.new_separator())
+            menu.append(WebKit2.ContextMenuItem.new_from_gaction(act, "Copy Page _Address", None))
         if hit.context_is_link():
             link = hit.get_link_uri()
             for i, item in enumerate(list(menu.get_items())):
@@ -991,7 +1004,21 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
         comp.connect("match-selected", self.on_completion)
         if not self.private:
             self.url.set_completion(comp)
-        bar.pack_start(self.url, True, True, 4)
+        # the address and its copy button share one rounded box: an entry has room for two icons,
+        # and those are the padlock and the 1Password key
+        self.urlbox = Gtk.Box()
+        self.urlbox.get_style_context().add_class("sh-urlbox")
+        self.urlbox.pack_start(self.url, True, True, 0)
+        self.copy_btn = Gtk.Button.new_from_icon_name("edit-copy-symbolic", Gtk.IconSize.MENU)
+        self.copy_btn.set_relief(Gtk.ReliefStyle.NONE)
+        self.copy_btn.get_style_context().add_class("sh-copy")
+        self.copy_btn.set_tooltip_text("Copy address")
+        self.copy_btn.set_can_focus(False)
+        self.copy_btn.connect("clicked", lambda *_: self.copy_address())
+        self.urlbox.pack_start(self.copy_btn, False, False, 0)
+        self.url.connect("focus-in-event", lambda *_: self.urlbox.get_style_context().add_class("sh-focus") or False)
+        self.url.connect("focus-out-event", lambda *_: self.urlbox.get_style_context().remove_class("sh-focus") or False)
+        bar.pack_start(self.urlbox, True, True, 4)
 
         self.zoom_btn = Gtk.Button(label="100%")
         self.zoom_btn.get_style_context().add_class("sh-zoom")
@@ -1305,7 +1332,11 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
         self.zoom_btn.set_visible(abs(z - self.app.prefs.data.get("default_zoom", 1.0)) > 0.001)
 
     def show_uri(self):
-        if self.editing or not self.current:
+        if not self.current:
+            return
+        if hasattr(self, "copy_btn"):
+            self.copy_btn.set_sensitive(bool(self.current.display_uri()))
+        if self.editing:
             return
         self.url.set_text(self.current.display_uri())
 
@@ -1343,6 +1374,13 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
             self.app.prefs.data.get("perms", {}).pop(host, None)
             self.app.prefs.changed()
         d.destroy()
+
+    def copy_address(self):
+        uri = self.current.display_uri() if self.current else ""
+        if not uri:
+            return
+        Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(uri, -1)
+        self.toast("Address copied", 2)
 
     def show_link(self, link):
         if self._toast_t:
