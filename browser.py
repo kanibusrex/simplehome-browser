@@ -28,7 +28,7 @@ sys.path.insert(0, HERE)
 import adblock  # noqa: E402
 import passwords  # noqa: E402
 
-VERSION = "1.3.2"
+VERSION = "1.4.0"
 APP_ID = "dev.simplehome.Browser"
 NAME = "SimpleHome Browser"
 DESKTOP_ID = "simplehome-browser.desktop"
@@ -389,6 +389,7 @@ BASE_CSS = """
 .sh-tabs.sh-side stack { min-width: 0; }
 .sh-newtab { padding: 6px 10px; margin-bottom: 4px; }
 .sh-savebar { padding: 6px 10px; }
+.sh-chrome { box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35); }
 .sh-bar { padding: 4px 6px 6px 6px; }
 .sh-bar button { padding: 4px 6px; min-height: 22px; }
 .sh-url { min-height: 30px; padding-left: 10px; border-radius: 8px; }
@@ -506,6 +507,7 @@ class Tab:
         view.connect("context-menu", self.on_context_menu)
         view.connect("mouse-target-changed", self.on_hover)
         view.connect("button-press-event", self.on_button)
+        view.connect("motion-notify-event", lambda v, ev: win.on_page_motion(v, ev))
         view.connect("show-notification", lambda *_: False)
         fc = view.get_find_controller()
         fc.connect("counted-matches", lambda c, n: win.find_count(self, n))
@@ -771,24 +773,16 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
 
     def layout(self, vertical):
         """Tabs on the side (a column left of the page, under the toolbar) or in a row on top.
-        Only the tab strip moves: GTK 3 entries keep a stale font after being re-parented."""
+
+        The toolbar (with the tab row, when tabs are on top) and the tab column float over the
+        page in revealers, with spacers under them while they're docked, so auto-hide can slide
+        them away without the page re-laying itself out. Only the notebook ever changes parent:
+        GTK 3 entries keep a stale font after being re-parented."""
         if vertical == self.vertical:
             return
         self.vertical = vertical
         if self.get_child() is None:
-            self.top_slot = Gtk.Box()
-            self.side_slot = Gtk.Box()
-            body = Gtk.Box()
-            body.pack_start(self.side_slot, False, False, 0)
-            body.pack_start(self.overlay, True, True, 0)
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-            box.pack_start(self.top_slot, False, False, 0)
-            box.pack_start(self.bar, False, False, 0)
-            box.pack_start(self.savebar, False, False, 0)
-            box.pack_start(body, True, True, 0)
-            box.pack_start(self.findbar, False, False, 0)
-            self.add(box)
-            box.show_all()
+            self.build_frame()
         nb = self.notebook
         if nb.get_parent():
             nb.get_parent().remove(nb)
@@ -801,8 +795,158 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
             t.set_vertical(vertical)
         (self.side_slot if vertical else self.top_slot).pack_start(nb, True, True, 0)
         nb.show()
+        self.side_rev.set_visible(vertical)
+        self.apply_chrome()
+
+    def build_frame(self):
+        self.top_slot = Gtk.Box()
+        self.side_slot = Gtk.Box()
+        top_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        top_box.pack_start(self.top_slot, False, False, 0)
+        top_box.pack_start(self.bar, False, False, 0)
+        self.top_box = top_box
+        self.top_ev = Gtk.EventBox()
+        self.top_ev.add(top_box)
+        self.side_ev = Gtk.EventBox()
+        self.side_ev.add(self.side_slot)
+        self.top_rev = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN,
+                                    transition_duration=160, valign=Gtk.Align.START)
+        self.top_rev.add(self.top_ev)
+        self.side_rev = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_RIGHT,
+                                     transition_duration=160, halign=Gtk.Align.START)
+        self.side_rev.add(self.side_ev)
+        self.top_space = Gtk.Box()
+        self.side_space = Gtk.Box()
+        body = Gtk.Box()
+        body.pack_start(self.side_space, False, False, 0)
+        body.pack_start(self.overlay, True, True, 0)
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        col.pack_start(self.top_space, False, False, 0)
+        col.pack_start(self.savebar, False, False, 0)
+        col.pack_start(body, True, True, 0)
+        col.pack_start(self.findbar, False, False, 0)
+        frame = Gtk.Overlay()
+        frame.add(col)
+        frame.add_overlay(self.side_rev)
+        frame.add_overlay(self.top_rev)
+        self.add(frame)
+        frame.show_all()
+        self._in = {"top": False, "side": False}
+        self._hide_t = {"top": 0, "side": 0}
+        for name, ev in (("top", self.top_ev), ("side", self.side_ev)):
+            ev.connect("enter-notify-event", self.on_chrome_cross, name, True)
+            ev.connect("leave-notify-event", self.on_chrome_cross, name, False)
+        top_box.connect("size-allocate", lambda *_: self.size_chrome())
+        self.side_slot.connect("size-allocate", lambda *_: self.size_chrome())
+        self.connect("leave-notify-event", self.on_window_leave)
+        for pop in (self.shield.get_popover(), self.dl_btn.get_popover(), self.menu_btn.get_popover(), self.pw_pop):
+            if pop:
+                pop.connect("closed", lambda *_: self.later_hide("top", 400))
+
+    # -- auto-hide
+    @property
+    def autohide(self):
+        return self.app.prefs.data.get("autohide", False) and not self.page_fullscreen
+
+    def apply_chrome(self):
+        """Docked: both shown, with room made for them. Auto-hide: both away until wanted."""
+        if not hasattr(self, "top_rev"):
+            return
+        for ev in (self.top_ev, self.side_ev):
+            (ev.get_style_context().add_class if self.autohide else ev.get_style_context().remove_class)("sh-chrome")
         if self.page_fullscreen:
-            nb.hide()
+            self.top_rev.set_reveal_child(False)
+            self.side_rev.set_reveal_child(False)
+        elif self.autohide:
+            self.top_rev.set_reveal_child(self.keep("top"))
+            self.side_rev.set_reveal_child(False)
+        else:
+            self.top_rev.set_reveal_child(True)
+            self.side_rev.set_reveal_child(True)
+        self.size_chrome()
+
+    def size_chrome(self):
+        """The spacers under docked chrome, and the tab column starting below the toolbar."""
+        th = self.top_box.get_preferred_height()[1]
+        sw = self.side_slot.get_preferred_width()[1] if self.vertical else 0
+        docked = not self.autohide and not self.page_fullscreen
+        want = (th if docked else 0, sw if docked else 0)
+        if getattr(self, "_spaces", None) != want:
+            self._spaces = want
+            self.top_space.set_size_request(-1, want[0])
+            self.side_space.set_size_request(want[1], -1)
+        margin = th if (docked or self.top_rev.get_reveal_child()) else 0
+        if self.side_rev.get_margin_top() != margin:
+            self.side_rev.set_margin_top(margin)
+
+    def keep(self, which):
+        """Whether that part must stay out: being used, or holding something open."""
+        if self._in.get(which):
+            return True
+        if which == "top":
+            pops = [self.shield.get_popover(), self.dl_btn.get_popover(), self.menu_btn.get_popover(), self.pw_pop]
+            return self.url.has_focus() or any(p and p.get_visible() for p in pops)
+        return False
+
+    def reveal(self, which, peek=0):
+        if not self.autohide or (which == "side" and not self.vertical):
+            return
+        rev = self.top_rev if which == "top" else self.side_rev
+        if self._hide_t[which]:
+            GLib.source_remove(self._hide_t[which])
+            self._hide_t[which] = 0
+        if not rev.get_reveal_child():
+            rev.set_reveal_child(True)
+            self.size_chrome()
+        if peek:
+            self.later_hide(which, peek)
+
+    def later_hide(self, which, delay=250):
+        if not self.autohide:
+            return
+        if self._hide_t[which]:
+            GLib.source_remove(self._hide_t[which])
+
+        def go():
+            self._hide_t[which] = 0
+            if self.autohide and not self.keep(which):
+                (self.top_rev if which == "top" else self.side_rev).set_reveal_child(False)
+                self.size_chrome()
+            return False
+        self._hide_t[which] = GLib.timeout_add(delay, go)
+
+    def on_page_motion(self, view, ev):
+        """Pointer over the page: at the top or left edge, out comes that part; well clear of
+        a shown part, it goes away again."""
+        if not self.autohide:
+            return False
+        x, y = ev.x, ev.y
+        if y <= 4:
+            self.reveal("top")
+        elif self.top_rev.get_reveal_child() and y > self.top_box.get_allocated_height() + 24:
+            self.later_hide("top")
+        if self.vertical:
+            if x <= 4:
+                self.reveal("side")
+            elif self.side_rev.get_reveal_child() and x > self.side_slot.get_allocated_width() + 24:
+                self.later_hide("side")
+        return False
+
+    def on_window_leave(self, w, ev):
+        # thrown at the screen edge, the pointer leaves the window before reaching x or y 0
+        if not self.autohide or ev.detail == Gdk.NotifyType.INFERIOR:
+            return False
+        if ev.y <= 2:
+            self.reveal("top")
+        elif self.vertical and ev.x <= 2:
+            self.reveal("side")
+        return False
+
+    def on_chrome_cross(self, w, ev, which, inside):
+        if ev.detail == Gdk.NotifyType.INFERIOR:
+            return False
+        self._in[which] = inside
+        return False
 
     # -- toolbar
     def build_bar(self):
@@ -832,7 +976,8 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
         self.url.connect("activate", self.on_url_activate)
         self.url.connect("changed", lambda *_: self.url.has_focus() and setattr(self, "editing", True))
         self.url.connect("focus-in-event", self.on_url_focus)
-        self.url.connect("focus-out-event", lambda *_: (setattr(self, "editing", False), self.show_uri())[0] and False)
+        self.url.connect("focus-out-event", lambda *_: (setattr(self, "editing", False), self.show_uri(),
+                                                         self.later_hide("top", 300))[0] and False)
         self.url.connect("icon-press", lambda e, pos, ev: self.show_site_info() if pos == Gtk.EntryIconPosition.PRIMARY
                          else self.app.passwords.fill(self))
         comp = Gtk.EntryCompletion(model=self.app.history.model, minimum_key_length=1, popup_set_width=True)
@@ -876,6 +1021,7 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
         bar.pack_start(self.dl_btn, False, False, 0)
 
         menu = Gtk.MenuButton()
+        self.menu_btn = menu
         menu.set_relief(Gtk.ReliefStyle.NONE)
         menu.set_tooltip_text("Menu")
         menu.add(Gtk.Image.new_from_icon_name("open-menu-symbolic", Gtk.IconSize.BUTTON))
@@ -1081,6 +1227,8 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
             return
         self.current = tab
         self.stack.set_visible_child(tab.view)
+        if hasattr(self, "_in") and self.vertical and not self._in["side"] and not getattr(self, "restoring", False):
+            self.reveal("side", peek=1200)  # auto-hide: a glimpse of where you are
         if tab.pending and not getattr(self, "restoring", False):
             self.load_pending(tab)
         self.editing = False
@@ -1254,6 +1402,7 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
     def focus_url(self):
         if self.page_fullscreen:
             return
+        self.reveal("top")
         self.url.grab_focus()
         self.url.select_region(0, -1)
 
@@ -1290,16 +1439,14 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
     # -- fullscreen
     def set_page_fullscreen(self, on):
         self.page_fullscreen = on
-        self.notebook.set_visible(not on)
-        self.bar.set_visible(not on)
+        self.apply_chrome()
         (self.fullscreen if on else self.unfullscreen)()
 
     def toggle_fullscreen(self):
         st = self.get_window().get_state() if self.get_window() else 0
         if st & Gdk.WindowState.FULLSCREEN:
             self.unfullscreen()
-            self.notebook.show()
-            self.bar.show()
+            self.apply_chrome()
         else:
             self.fullscreen()
 
@@ -1737,6 +1884,9 @@ class App(Gtk.Application):
             a.connect("activate", self.on_pref_toggle, key)
             a.set_enabled(self.passwords.op.available)
             self.add_action(a)
+        ah = Gio.SimpleAction.new_stateful("autohide", None, GLib.Variant("b", self.prefs.data.get("autohide", False)))
+        ah.connect("activate", self.on_autohide)
+        self.add_action(ah)
         side = Gio.SimpleAction.new_stateful("vertical-tabs", None, GLib.Variant("b", self.prefs.data.get("vertical_tabs", True)))
         side.connect("activate", self.on_vertical_tabs)
         self.add_action(side)
@@ -1771,6 +1921,7 @@ class App(Gtk.Application):
         op.append("Offer to save new logins", "app.op-save")
         s3.append_submenu("1Password", op)
         s3.append("Tabs on the side", "app.vertical-tabs")
+        s3.append("Auto-hide toolbar and tabs", "app.autohide")
         s3.append("Reopen last session's tabs", "app.restore")
         s3.append("Clear history…", "app.clear-history")
         s3.append("Clear cookies and site data…", "app.clear-data")
@@ -1805,6 +1956,14 @@ class App(Gtk.Application):
         for w in self.windows():
             if w.view:
                 w.update_security()
+
+    def on_autohide(self, a, _v):
+        on = not a.get_state().get_boolean()
+        a.set_state(GLib.Variant("b", on))
+        self.prefs.data["autohide"] = on
+        self.prefs.changed()
+        for w in self.windows():
+            w.apply_chrome()
 
     def on_vertical_tabs(self, a, _v):
         on = not a.get_state().get_boolean()
