@@ -43,7 +43,13 @@ class Matching(unittest.TestCase):
 class Errors(unittest.TestCase):
     def test_friendly(self):
         self.assertEqual(op.friendly("[ERROR] 2026/11/06 No accounts configured for use with 1Password CLI.")[1], "setup")
-        self.assertEqual(op.friendly("[ERROR] 2026/11/06 authorization prompt dismissed, please try again")[1], "cancelled")
+        self.assertEqual(op.friendly("[ERROR] 2026/11/06 authorization prompt dismissed, please try again")[1], "retry")
+        reset = ("[ERROR] 2026/11/06 17:31:08 connecting to desktop app: connection reset, make sure 1Password CLI is "
+                 "installed correctly, then open the 1Password app, select 1Password > Settings > Developer and make "
+                 "sure the 'Integrate with 1Password CLI' setting is turned on.")
+        msg, kind = op.friendly(reset)
+        self.assertEqual(kind, "retry")
+        self.assertIn("Authorize", msg)
         timeout = ("[ERROR] 2026/11/06 17:20:01 connecting to desktop app timed out, make sure it is "
                    "installed, running and CLI integration is enabled")
         self.assertEqual(op.friendly(timeout)[1], "retry")  # not "turn the integration on"

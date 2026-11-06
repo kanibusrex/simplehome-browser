@@ -39,7 +39,11 @@ def friendly(stderr):
         return ("1Password didn't answer in time. Make sure the 1Password app is open (unlock it if "
                 "it's locked), then try again.", "retry")
     if "dismiss" in low or "cancel" in low or "authorization timeout" in low or "user did not" in low:
-        return ("1Password stayed locked.", "cancelled")
+        return ("1Password didn't allow it. When 1Password asks to allow /usr/bin/python3 to get CLI access, "
+                "that's this browser: click Authorize.", "retry")
+    if "connection reset" in low or "broken pipe" in low or "eof" in low.split():
+        return ("1Password closed the connection. If a 1Password window asked to allow /usr/bin/python3, "
+                "click Authorize (that's this browser), then try again.", "retry")
     if ("no accounts configured" in low or "turn on the 1password desktop app integration" in low
             or "desktop app integration" in low):
         return ("1Password isn't connected yet. In the 1Password app, turn on Settings → Developer → "

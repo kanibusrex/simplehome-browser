@@ -182,7 +182,10 @@ class Passwords:
         if uri.startswith("http://") and not onepassword.is_local(host):
             win.pw_message(f"{host} isn't using a secure connection, so 1Password won't fill it.")
             return
-        win.pw_message("Looking in 1Password…", busy=True)
+        win.pw_message("Looking in 1Password…", busy=True,
+                       detail=None if self.op.has_list else
+                       "If 1Password asks to allow /usr/bin/python3 to get CLI access, that's this browser "
+                       "(it runs on Python): click Authorize. It asks again after 1Password locks.")
         refresh = getattr(win, "_pw_retry", False)
         win._pw_retry = False
 
