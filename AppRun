@@ -1,9 +1,31 @@
 #!/bin/sh
 # SimpleHome Browser AppImage entry point: the system's Python, GTK 3 and WebKitGTK 4.1 run the bundled app
 HERE="$(dirname "$(readlink -f "$0")")"
+SCRIPT="$HERE/usr/share/simplehome-browser/browser.py"
 if ! python3 -c 'import gi; gi.require_version("WebKit2", "4.1")' 2>/dev/null; then
   msg="SimpleHome Browser needs python-gobject and webkit2gtk-4.1:  sudo pacman -S python-gobject webkit2gtk-4.1"
   command -v notify-send >/dev/null && notify-send "SimpleHome Browser" "$msg"
   echo "$msg" >&2; exit 1
 fi
-exec python3 -I "$HERE/usr/share/simplehome-browser/browser.py" "$@"
+
+# Run as a program named "SimpleHome Browser": a copy of the system's python3 set up the way a
+# Python virtual environment is (pyvenv.cfg pointing home at the system's Python, system packages
+# on). Programs that name whoever asks them for something, like 1Password's "Allow … to get CLI
+# access" prompt, then name the browser rather than /usr/bin/python3. It's refreshed whenever the
+# system's Python changes, and anything wrong with it falls back to plain python3.
+DATA="${SIMPLEHOME_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/simplehome-browser}"
+RT="$DATA/runtime"
+LAUNCH="$RT/bin/SimpleHome Browser"
+PY="$(readlink -f "$(command -v python3)")"
+if [ -n "$PY" ] && ! cmp -s "$PY" "$LAUNCH" 2>/dev/null; then
+  rm -f "$RT/ok"
+  if mkdir -p "$RT/bin" && cp "$PY" "$LAUNCH.new" && mv -f "$LAUNCH.new" "$LAUNCH" &&
+     printf 'home = %s\ninclude-system-site-packages = true\n' "$(dirname "$PY")" >"$RT/pyvenv.cfg" &&
+     "$LAUNCH" -I -c 'import gi; gi.require_version("WebKit2", "4.1"); from gi.repository import WebKit2' 2>/dev/null; then
+    echo "$PY" >"$RT/ok"
+  fi
+fi
+if [ -x "$LAUNCH" ] && [ -f "$RT/ok" ]; then
+  exec "$LAUNCH" -I "$SCRIPT" "$@"
+fi
+exec python3 -I "$SCRIPT" "$@"

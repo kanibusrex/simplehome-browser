@@ -184,8 +184,8 @@ class Passwords:
             return
         win.pw_message("Looking in 1Password…", busy=True,
                        detail=None if self.op.has_list else
-                       "If 1Password asks to allow /usr/bin/python3 to get CLI access, that's this browser "
-                       "(it runs on Python): click Authorize. It asks again after 1Password locks.")
+                       "1Password may ask to allow SimpleHome Browser to get CLI access: click Authorize. "
+                       "It asks again after 1Password locks.")
         refresh = getattr(win, "_pw_retry", False)
         win._pw_retry = False
 
