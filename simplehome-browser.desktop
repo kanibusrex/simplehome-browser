@@ -1,0 +1,22 @@
+[Desktop Entry]
+Type=Application
+Name=SimpleHome Browser
+GenericName=Web Browser
+Comment=A small tabbed web browser with SimpleHome as its new tab page
+Exec=simplehome-browser %U
+Icon=simplehome-browser
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=text/html;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;
+StartupWMClass=dev.simplehome.Browser
+StartupNotify=true
+Keywords=web;browser;internet;tabs;
+Actions=new-window;private-window;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=simplehome-browser --new-window
+
+[Desktop Action private-window]
+Name=New Private Window
+Exec=simplehome-browser --private-window
