@@ -26,8 +26,9 @@ from gi.repository import Gdk, Gio, GLib, Gtk, Pango, WebKit2  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import adblock  # noqa: E402
+import passwords  # noqa: E402
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 APP_ID = "dev.simplehome.Browser"
 NAME = "SimpleHome Browser"
 DESKTOP_ID = "simplehome-browser.desktop"
@@ -387,6 +388,7 @@ BASE_CSS = """
 .sh-tabs.sh-side > header tab { padding: 6px 6px 6px 10px; margin: 1px 0; min-height: 24px; }
 .sh-tabs.sh-side stack { min-width: 0; }
 .sh-newtab { padding: 6px 10px; margin-bottom: 4px; }
+.sh-savebar { padding: 6px 10px; }
 .sh-bar { padding: 4px 6px 6px 6px; }
 .sh-bar button { padding: 4px 6px; min-height: 22px; }
 .sh-url { min-height: 30px; padding-left: 10px; border-radius: 8px; }
@@ -426,6 +428,11 @@ def theme_css(p, private=False):
 .sh-tabs.sh-side > header tab {{ border-radius: 8px; }}
 .sh-tabs.sh-side > header tab:checked {{ box-shadow: inset 3px 0 @sh_acc; }}
 .sh-newtab, .sh-newtab label {{ color: @sh_muted; }}
+.sh-savebar {{ background: @sh_surface; color: @sh_fg; box-shadow: inset 0 -1px @sh_border; }}
+.sh-savebar button {{ background: @sh_raised; color: @sh_fg; border: none; box-shadow: none; }}
+.sh-savebar button.suggested-action {{ background: @sh_acc; color: @sh_bg; }}
+.sh-window popover list, .sh-window popover row {{ background: transparent; color: @sh_fg; }}
+.sh-window popover row:selected {{ background: @sh_raised; }}
 .sh-newtab:hover, .sh-newtab:hover label {{ color: @sh_fg; }}
 .sh-tabs > header tab label {{ color: inherit; }}
 .sh-tabs > header button, .sh-bar button, .sh-find button {{ background: transparent; color: @sh_fg; border: none; box-shadow: none; text-shadow: none; -gtk-icon-shadow: none; }}
@@ -536,6 +543,9 @@ class Tab:
 
     def on_uri(self, *_):
         self.win.app.blocker.apply_to(self.view.get_user_content_manager(), self.uri)
+        self.win.hide_save_for(self)
+        if getattr(self, "filled_host", None) and host_of(self.uri) != self.filled_host:
+            self.filled_host = None
         self.win.tab_changed(self, uri=True)
         self.win.save_session()
 
@@ -690,7 +700,7 @@ class Tab:
 
 # ---------------------------------------------------------------- a window
 
-class Window(Gtk.ApplicationWindow):
+class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
     def __init__(self, app, private=False):
         super().__init__(application=app, title=NAME)
         self.app = app
@@ -748,6 +758,8 @@ class Window(Gtk.ApplicationWindow):
         self.overlay.add_overlay(self.status_rev)
         self.overlay.set_overlay_pass_through(self.status_rev, True)
 
+        self.build_pw()
+        self._toast_t = 0
         self.vertical = None
         self.layout(app.prefs.data.get("vertical_tabs", True))
         self.connect("key-press-event", self.on_key)
@@ -771,6 +783,7 @@ class Window(Gtk.ApplicationWindow):
             box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
             box.pack_start(self.top_slot, False, False, 0)
             box.pack_start(self.bar, False, False, 0)
+            box.pack_start(self.savebar, False, False, 0)
             box.pack_start(body, True, True, 0)
             box.pack_start(self.findbar, False, False, 0)
             self.add(box)
@@ -819,7 +832,8 @@ class Window(Gtk.ApplicationWindow):
         self.url.connect("changed", lambda *_: self.url.has_focus() and setattr(self, "editing", True))
         self.url.connect("focus-in-event", self.on_url_focus)
         self.url.connect("focus-out-event", lambda *_: (setattr(self, "editing", False), self.show_uri())[0] and False)
-        self.url.connect("icon-press", lambda *_: self.show_site_info())
+        self.url.connect("icon-press", lambda e, pos, ev: self.show_site_info() if pos == Gtk.EntryIconPosition.PRIMARY
+                         else self.app.passwords.fill(self))
         comp = Gtk.EntryCompletion(model=self.app.history.model, minimum_key_length=1, popup_set_width=True)
         cell_t = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
         cell_u = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END, foreground_rgba=Gdk.RGBA(0.55, 0.6, 0.65, 1))
@@ -1032,6 +1046,7 @@ class Window(Gtk.ApplicationWindow):
             view = WebKit2.WebView(web_context=app.context_for(self.private), user_content_manager=ucm,
                                    settings=app.settings, is_controlled_by_automation=False)
         tab = Tab(self, view)
+        app.passwords.attach(ucm, tab)
         self.tabs.append(tab)  # before insert_page, whose switch-page looks the tab up
         self.stack.add(view)
         if index is None:
@@ -1145,6 +1160,9 @@ class Window(Gtk.ApplicationWindow):
             icon, tip = "channel-insecure-symbolic", "Connection isn't secure"
         self.url.set_icon_from_icon_name(Gtk.EntryIconPosition.PRIMARY, icon)
         self.url.set_icon_tooltip_text(Gtk.EntryIconPosition.PRIMARY, tip)
+        key = self.app.passwords.enabled and is_web(uri)
+        self.url.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, "dialog-password-symbolic" if key else None)
+        self.url.set_icon_tooltip_text(Gtk.EntryIconPosition.SECONDARY, "Fill from 1Password (Ctrl+Shift+L)" if key else None)
 
     def show_site_info(self):
         host = site_of(host_of(self.view.get_uri() if self.view else ""))
@@ -1164,11 +1182,26 @@ class Window(Gtk.ApplicationWindow):
         d.destroy()
 
     def show_link(self, link):
+        if self._toast_t:
+            return  # a toast is showing; links can wait
         if link:
             self.status.set_text(link)
             self.status_rev.show()
         else:
             self.status_rev.hide()
+
+    def toast(self, text, seconds=4):
+        """A short note in the corner where link addresses show."""
+        if self._toast_t:
+            GLib.source_remove(self._toast_t)
+        self.status.set_text(text)
+        self.status_rev.show()
+
+        def end():
+            self._toast_t = 0
+            self.status_rev.hide()
+            return False
+        self._toast_t = GLib.timeout_add_seconds(seconds, end)
 
     # -- address bar
     def on_url_focus(self, *_):
@@ -1290,6 +1323,7 @@ class Window(Gtk.ApplicationWindow):
         elif st == ctrl | shift:
             act = {
                 "t": self.reopen_closed, "n": lambda: self.app.new_window(private=True),
+                "l": lambda: self.app.passwords.fill(self),
                 "r": lambda: v and v.reload_bypass_cache(), "i": self.inspect, "j": self.inspect,
                 "Tab": lambda: self.cycle(-1), "ISO_Left_Tab": lambda: self.cycle(-1),
                 "g": lambda: self.find_step(-1), "w": self.close,
@@ -1583,6 +1617,7 @@ class App(Gtk.Application):
             enable_media_stream=True, enable_webrtc=True, enable_smooth_scrolling=True,
             javascript_can_open_windows_automatically=False, enable_encrypted_media=False)
         self.blocker = Blocker(self)
+        self.passwords = passwords.Passwords(self)
         self.build_actions()
         self.home_html = self.read_home()
         self.css = Gtk.CssProvider()
@@ -1677,6 +1712,11 @@ class App(Gtk.Application):
                                                            GLib.Variant("s", self.prefs.data.get("engine", "google")))
         self.engine_action.connect("activate", self.on_engine)
         self.add_action(self.engine_action)
+        for name, key in (("op-fill", "op_fill"), ("op-save", "op_save")):
+            a = Gio.SimpleAction.new_stateful(name, None, GLib.Variant("b", self.prefs.data.get(key, True)))
+            a.connect("activate", self.on_pref_toggle, key)
+            a.set_enabled(self.passwords.op.available)
+            self.add_action(a)
         side = Gio.SimpleAction.new_stateful("vertical-tabs", None, GLib.Variant("b", self.prefs.data.get("vertical_tabs", True)))
         side.connect("activate", self.on_vertical_tabs)
         self.add_action(side)
@@ -1706,6 +1746,10 @@ class App(Gtk.Application):
         for k, (label, _) in ENGINES.items():
             eng.append(label, f"app.engine::{k}")
         s3.append_submenu("Address bar searches with", eng)
+        op = Gio.Menu()
+        op.append("Fill logins (Ctrl+Shift+L)", "app.op-fill")
+        op.append("Offer to save new logins", "app.op-save")
+        s3.append_submenu("1Password", op)
         s3.append("Tabs on the side", "app.vertical-tabs")
         s3.append("Reopen last session's tabs", "app.restore")
         s3.append("Clear history…", "app.clear-history")
@@ -1732,6 +1776,15 @@ class App(Gtk.Application):
                         f"localStorage.setItem('homepage.engine', {json.dumps(url)});"
                         f"var s=document.getElementById('engineSelect'); if (s) s.value={json.dumps(url)};",
                         -1, None, None, None, None)
+
+    def on_pref_toggle(self, a, _v, key):
+        on = not a.get_state().get_boolean()
+        a.set_state(GLib.Variant("b", on))
+        self.prefs.data[key] = on
+        self.prefs.changed()
+        for w in self.windows():
+            if w.view:
+                w.update_security()
 
     def on_vertical_tabs(self, a, _v):
         on = not a.get_state().get_boolean()
