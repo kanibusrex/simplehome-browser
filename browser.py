@@ -28,7 +28,7 @@ sys.path.insert(0, HERE)
 import adblock  # noqa: E402
 import passwords  # noqa: E402
 
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 APP_ID = "dev.simplehome.Browser"
 NAME = "SimpleHome Browser"
 DESKTOP_ID = "simplehome-browser.desktop"
@@ -44,6 +44,7 @@ ENGINES = {
     "duckduckgo": ("DuckDuckGo", "https://duckduckgo.com/?q="),
     "bing": ("Bing", "https://www.bing.com/search?q="),
 }
+SLEEP_CHOICES = [(5, "After 5 minutes"), (10, "After 10 minutes"), (30, "After 30 minutes"), (0, "Never")]
 ZOOMS = [0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0]
 
 
@@ -430,6 +431,7 @@ def theme_css(p, private=False):
 .sh-tabs > header tab:checked {{ background: @sh_surface; color: @sh_fg; box-shadow: inset 0 2px @sh_acc; }}
 .sh-tabs.sh-side > header {{ box-shadow: inset -1px 0 @sh_border; }}
 .sh-tabs.sh-side > header tab {{ border-radius: 8px; }}
+.sh-asleep {{ opacity: 0.55; }}
 .sh-tabs.sh-side > header tab:checked {{ box-shadow: inset 3px 0 @sh_acc; }}
 .sh-newtab, .sh-newtab label {{ color: @sh_muted; }}
 .sh-savebar {{ background: @sh_surface; color: @sh_fg; box-shadow: inset 0 -1px @sh_border; }}
@@ -471,6 +473,9 @@ class Tab:
         self.view = view
         self.private = win.private
         self.pending = None  # a restored tab's address, loaded the first time the tab is shown
+        self.asleep = False  # its page process shut down to save memory and CPU; wakes when shown
+        self.shares_process = False  # opened with or by window.open: one process for both tabs
+        self.hidden_since = time.time()
         self.title = "New tab"
         self.zoom_set = False
         # the notebook only draws the tab strip; the page itself lives in the window's stack
@@ -522,6 +527,8 @@ class Tab:
 
     @property
     def uri(self):
+        if self.asleep:
+            return self.sleep_uri
         return self.view.get_uri() or self.pending or ""
 
     def set_vertical(self, vertical):
@@ -643,6 +650,7 @@ class Tab:
             return None
         bg = action.get_mouse_button() == 2 or bool(action.get_modifiers() & Gdk.ModifierType.CONTROL_MASK)
         tab = self.win.new_tab(None, related=view, background=bg)
+        tab.shares_process = self.shares_process = True
         return tab.view
 
     def on_hover(self, view, hit, mods):
@@ -698,9 +706,40 @@ class Tab:
             view.load_uri(HOME_URI)
         return True
 
+    def can_sleep(self, minutes):
+        if self.asleep or self.pending or self.shares_process or self is self.win.current:
+            return False
+        if not is_web(self.uri) or self.view.is_playing_audio():
+            return False
+        return time.time() - self.hidden_since > minutes * 60
+
+    def sleep(self):
+        """End the page's process; the tab keeps its title, icon and history."""
+        log("sleeping", self.uri)
+        self.sleep_uri = self.uri  # the view forgets its address once the process is gone
+        self.asleep = True
+        self.head.get_style_context().add_class("sh-asleep")
+        self.view.terminate_web_process()
+
+    def wake(self):
+        if not self.asleep:
+            return
+        self.asleep = False
+        self.head.get_style_context().remove_class("sh-asleep")
+        self.win.app.blocker.apply_to(self.view.get_user_content_manager(), self.uri)
+        # the back/forward list is kept on this side, so going to its current item brings the
+        # page back with its history; without one, the address does
+        item = self.view.get_back_forward_list().get_current_item()
+        if item:
+            self.view.go_to_back_forward_list_item(item)  # reload() would add a second entry
+        else:
+            self.view.load_uri(self.sleep_uri)
+
     def on_crash(self, view, reason):
         uri = self.uri
         log("web process ended", uri, reason)
+        if self.asleep:
+            return  # we ended it ourselves
         # a one-off: load it again by itself; a page that keeps dying gets the message instead
         now = time.time()
         if reason != WebKit2.WebProcessTerminationReason.EXCEEDED_MEMORY_LIMIT and now - getattr(self, "_crashed_at", 0) > 60:
@@ -1252,8 +1291,11 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
         tab = next((t for t in self.tabs if t.slot is slot), None)
         if not tab:
             return
+        if self.current and self.current is not tab:
+            self.current.hidden_since = time.time()
         self.current = tab
         self.stack.set_visible_child(tab.view)
+        tab.wake()
         if hasattr(self, "_in") and self.vertical and not self._in["side"] and not getattr(self, "restoring", False):
             self.reveal("side", peek=1200)  # auto-hide: a glimpse of where you are
         if tab.pending and not getattr(self, "restoring", False):
@@ -1833,6 +1875,7 @@ class App(Gtk.Application):
             self.theme_mon = Gio.File.new_for_path(OMARCHY_STATE).monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, None)
             self.theme_mon.connect("changed", self.on_theme_files)
         self.blocker.start()
+        GLib.timeout_add_seconds(int(os.environ.get("SIMPLEHOME_SLEEP_CHECK", "30")), self.sleep_tabs)
         if os.environ.get("SIMPLEHOME_SELFTEST_1P"):
             # diagnostics: ask 1Password for the list once, as Ctrl+Shift+L would; the result goes
             # to 1password.log in the cache folder (titles and secrets never do)
@@ -1925,6 +1968,10 @@ class App(Gtk.Application):
         ah = Gio.SimpleAction.new_stateful("autohide", None, GLib.Variant("b", self.prefs.data.get("autohide", False)))
         ah.connect("activate", self.on_autohide)
         self.add_action(ah)
+        sl = Gio.SimpleAction.new_stateful("sleep", GLib.VariantType.new("s"),
+                                           GLib.Variant("s", str(self.prefs.data.get("sleep_minutes", 10))))
+        sl.connect("activate", self.on_sleep_choice)
+        self.add_action(sl)
         side = Gio.SimpleAction.new_stateful("vertical-tabs", None, GLib.Variant("b", self.prefs.data.get("vertical_tabs", True)))
         side.connect("activate", self.on_vertical_tabs)
         self.add_action(side)
@@ -1958,6 +2005,10 @@ class App(Gtk.Application):
         op.append("Fill logins (Ctrl+Shift+L)", "app.op-fill")
         op.append("Offer to save new logins", "app.op-save")
         s3.append_submenu("1Password", op)
+        sleep = Gio.Menu()
+        for mins, label in SLEEP_CHOICES:
+            sleep.append(label, f"app.sleep::{mins}")
+        s3.append_submenu("Sleep background tabs", sleep)
         s3.append("Tabs on the side", "app.vertical-tabs")
         s3.append("Auto-hide toolbar and tabs", "app.autohide")
         s3.append("Reopen last session's tabs", "app.restore")
@@ -1994,6 +2045,11 @@ class App(Gtk.Application):
         for w in self.windows():
             if w.view:
                 w.update_security()
+
+    def on_sleep_choice(self, a, v):
+        a.set_state(v)
+        self.prefs.data["sleep_minutes"] = int(v.get_string())
+        self.prefs.changed()
 
     def on_autohide(self, a, _v):
         on = not a.get_state().get_boolean()
@@ -2109,6 +2165,19 @@ class App(Gtk.Application):
                 return "https://" + t
         key = self.prefs.data.get("engine", "google")
         return ENGINES.get(key, ENGINES["google"])[1] + urllib.parse.quote_plus(t)
+
+    def sleep_tabs(self):
+        """Background tabs left alone long enough give up their page process (and its memory
+        and CPU: a hidden YouTube or news page keeps running at full tilt otherwise)."""
+        minutes = self.prefs.data.get("sleep_minutes", 10)
+        if os.environ.get("SIMPLEHOME_SLEEP_SECONDS"):
+            minutes = float(os.environ["SIMPLEHOME_SLEEP_SECONDS"]) / 60
+        if minutes:
+            for w in self.windows():
+                for t in w.tabs:
+                    if t.can_sleep(minutes):
+                        t.sleep()
+        return True
 
     def refilter(self, reload_current=None):
         """Give every tab the current filter (or take it away) for the page it shows."""
