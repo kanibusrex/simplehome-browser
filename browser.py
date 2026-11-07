@@ -31,7 +31,7 @@ import mpvplay  # noqa: E402
 import onscreen  # noqa: E402
 import passwords  # noqa: E402
 
-VERSION = "1.8.2"
+VERSION = "1.8.3"
 APP_ID = "dev.simplehome.Browser"
 NAME = "SimpleHome Browser"
 DESKTOP_ID = "simplehome-browser.desktop"
@@ -998,6 +998,15 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
         self.side_rev = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_RIGHT,
                                      transition_duration=160, halign=Gtk.Align.START)
         self.side_rev.add(self.side_ev)
+        # GTK 3 never allocates a visible widget less than 1x1, so anything "empty" around the
+        # page still took a pixel: the spacers, and the collapsed save-password and find bars,
+        # pushed the page 1px in from the top and left, and the window colour showed through as
+        # a dark line (blocky where it met the rounded corners). Empty pieces are hidden instead
+        # (here, and the spacers in size_chrome); the floating chrome is unmapped once hidden.
+        for rev in (self.top_rev, self.side_rev):
+            rev.connect("notify::reveal-child", self.on_rev_state)
+            rev.connect("notify::child-revealed", self.on_rev_state)
+            self.on_rev_state(rev)
         self.top_space = Gtk.Box()
         self.side_space = Gtk.Box()
         body = Gtk.Box()
@@ -1014,6 +1023,10 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
         frame.add_overlay(self.top_rev)
         self.add(frame)
         frame.show_all()
+        for rev in (self.savebar, self.findbar):
+            rev.set_no_show_all(True)
+            rev.connect("notify::reveal-child", lambda r, _: r.set_visible(r.get_reveal_child()))
+            rev.set_visible(rev.get_reveal_child())
         self._in = {"top": False, "side": False}
         self._hide_t = {"top": 0, "side": 0}
         for name, ev in (("top", self.top_ev), ("side", self.side_ev)):
@@ -1027,6 +1040,10 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
                 pop.connect("closed", lambda *_: self.later_hide("top", 400))
 
     # -- auto-hide
+    @staticmethod
+    def on_rev_state(rev, *_):
+        rev.set_child_visible(rev.get_reveal_child() or rev.get_child_revealed())
+
     @property
     def autohide(self):
         return self.app.prefs.data.get("autohide", False) and not self.page_fullscreen
@@ -1058,6 +1075,8 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
             self._spaces = want
             self.top_space.set_size_request(-1, want[0])
             self.side_space.set_size_request(want[1], -1)
+            self.top_space.set_visible(want[0] > 0)
+            self.side_space.set_visible(want[1] > 0)
         margin = th if (docked or self.top_rev.get_reveal_child()) else 0
         if self.side_rev.get_margin_top() != margin:
             self.side_rev.set_margin_top(margin)
