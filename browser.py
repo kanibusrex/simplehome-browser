@@ -26,10 +26,11 @@ from gi.repository import Gdk, Gio, GLib, Gtk, Pango, WebKit2  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import adblock  # noqa: E402
+import bookmarks  # noqa: E402
 import mpvplay  # noqa: E402
 import passwords  # noqa: E402
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 APP_ID = "dev.simplehome.Browser"
 NAME = "SimpleHome Browser"
 DESKTOP_ID = "simplehome-browser.desktop"
@@ -112,7 +113,8 @@ class History:
     """Sites visited (never in private windows), ranked by how often and how lately."""
     LIMIT = 5000
 
-    def __init__(self):
+    def __init__(self, saved=None):
+        self.saved = saved  # SavedBookmarks: shown first, starred, in address bar suggestions
         self.store = Store("history.json", [])
         self.by_url = {h["u"]: h for h in self.store.data if isinstance(h, dict) and "u" in h}
         self.model = Gtk.ListStore(str, str, str)  # url, title, url shown without the scheme
@@ -154,16 +156,57 @@ class History:
     def rebuild_model(self):
         self._model_t = 0
         self.model.clear()
+        marked = set()
+        if self.saved:
+            for b in self.saved.list.items:
+                marked.add(bookmarks.normal(b["u"]))
+                self.model.append([b["u"], "\u2605 " + self.saved.list.title_of(b), bookmarks.shown(b["u"])])
         for h in sorted(self.by_url.values(), key=self.score, reverse=True)[:1500]:
-            shown = re.sub(r"^https?://(www\.)?", "", h["u"]).rstrip("/")
-            self.model.append([h["u"], h.get("ti") or "", shown])
+            if bookmarks.normal(h["u"]) in marked:
+                continue
+            self.model.append([h["u"], h.get("ti") or "", bookmarks.shown(h["u"])])
         return False
+
+    def soon(self):
+        if not self._model_t:
+            self._model_t = GLib.timeout_add(300, self.rebuild_model)
 
     def clear(self):
         self.by_url = {}
         self.store.data = []
         self.store.flush()
         self.rebuild_model()
+
+
+class SavedBookmarks:
+    """bookmarks.json, shared by every window (private ones too: saving one is a deliberate act)."""
+
+    def __init__(self):
+        self.store = Store("bookmarks.json", [])
+        self.list = bookmarks.Bookmarks(self.store.data)
+        self.listeners = []
+
+    def changed(self):
+        self.store.data = self.list.items
+        self.store.changed(300)
+        for cb in list(self.listeners):
+            cb()
+
+    def has(self, url):
+        return is_web(url) and self.list.has(url)
+
+    def add(self, url, title=""):
+        b = self.list.add(url, title)
+        self.changed()
+        return b
+
+    def remove(self, url):
+        if self.list.remove(url):
+            self.changed()
+
+    def rename(self, url, title):
+        if self.list.rename(url, title):
+            self.changed()
 
 
 # ---------------------------------------------------------------- ad blocking
@@ -398,6 +441,9 @@ BASE_CSS = """
 .sh-urlbox { border-radius: 8px; }
 .sh-urlbox entry { border-radius: 8px 0 0 8px; border-right: none; }
 .sh-urlbox button.sh-copy { border-radius: 0 8px 8px 0; padding: 0 9px; min-height: 30px; min-width: 0; }
+.sh-urlbox button.sh-star { border-radius: 0; padding: 0 7px; min-height: 30px; min-width: 0; }
+.sh-bm-row { padding: 4px 6px; }
+.sh-bm-row button { padding: 2px; min-height: 0; min-width: 0; }
 .sh-find { padding: 4px 8px; }
 .sh-zoom { padding: 2px 8px; font-size: 90%; }
 .sh-status { padding: 3px 8px; margin: 0 0 4px 4px; border-radius: 6px; font-size: 90%; }
@@ -449,9 +495,11 @@ def theme_css(p, private=False):
 .sh-bar {{ background: @sh_surface; }}
 .sh-window entry {{ {font} background: @sh_bg; color: @sh_fg; border: 1px solid @sh_border; box-shadow: none; caret-color: @sh_acc; }}
 .sh-window entry:focus {{ border-color: @sh_acc; }}
-.sh-window .sh-urlbox button.sh-copy {{ background: @sh_bg; color: @sh_muted; border: 1px solid @sh_border; border-left: none; box-shadow: none; }}
-.sh-window .sh-urlbox button.sh-copy:hover {{ color: @sh_fg; background: @sh_raised; }}
-.sh-window .sh-urlbox.sh-focus button.sh-copy {{ border-color: @sh_acc; }}
+.sh-window .sh-urlbox button.sh-copy, .sh-window .sh-urlbox button.sh-star {{ background: @sh_bg; color: @sh_muted; border: 1px solid @sh_border; border-left: none; box-shadow: none; }}
+.sh-window .sh-urlbox button.sh-copy:hover, .sh-window .sh-urlbox button.sh-star:hover {{ color: @sh_fg; background: @sh_raised; }}
+.sh-window .sh-urlbox.sh-focus button.sh-copy, .sh-window .sh-urlbox.sh-focus button.sh-star {{ border-color: @sh_acc; }}
+.sh-window .sh-urlbox button.sh-star.sh-starred, .sh-window .sh-urlbox button.sh-star.sh-starred image {{ color: @sh_acc; }}
+.sh-window .sh-bm-row .dim-label {{ color: @sh_muted; }}
 .sh-window entry selection {{ background: @sh_acc; color: @sh_bg; }}
 .sh-window entry image {{ color: @sh_muted; }}
 .sh-window entry progress {{ border: none; border-bottom: 2px solid @sh_acc; background: none; }}
@@ -824,6 +872,10 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
         self.overlay.set_overlay_pass_through(self.status_rev, True)
 
         self.build_pw()
+        self.build_star_popover()
+        self.app.saved.listeners.append(self.on_bookmarks_changed)
+        self.connect("destroy", lambda *_: self.on_bookmarks_changed in self.app.saved.listeners
+                     and self.app.saved.listeners.remove(self.on_bookmarks_changed))
         self._toast_t = 0
         self.vertical = None
         self.layout(app.prefs.data.get("vertical_tabs", True))
@@ -901,7 +953,7 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
         top_box.connect("size-allocate", lambda *_: self.size_chrome())
         self.side_slot.connect("size-allocate", lambda *_: self.size_chrome())
         self.connect("leave-notify-event", self.on_window_leave)
-        for pop in (self.shield.get_popover(), self.dl_btn.get_popover(), self.menu_btn.get_popover(), self.pw_pop):
+        for pop in self.chrome_popovers():
             if pop:
                 pop.connect("closed", lambda *_: self.later_hide("top", 400))
 
@@ -941,13 +993,16 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
         if self.side_rev.get_margin_top() != margin:
             self.side_rev.set_margin_top(margin)
 
+    def chrome_popovers(self):
+        return [self.shield.get_popover(), self.dl_btn.get_popover(), self.menu_btn.get_popover(), self.pw_pop,
+                self.bm_pop, self.star_pop]
+
     def keep(self, which):
         """Whether that part must stay out: being used, or holding something open."""
         if self._in.get(which):
             return True
         if which == "top":
-            pops = [self.shield.get_popover(), self.dl_btn.get_popover(), self.menu_btn.get_popover(), self.pw_pop]
-            return self.url.has_focus() or any(p and p.get_visible() for p in pops)
+            return self.url.has_focus() or any(p and p.get_visible() for p in self.chrome_popovers())
         return False
 
     def reveal(self, which, peek=0):
@@ -1058,6 +1113,13 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
         self.urlbox = Gtk.Box()
         self.urlbox.get_style_context().add_class("sh-urlbox")
         self.urlbox.pack_start(self.url, True, True, 0)
+        self.star_btn = Gtk.Button.new_from_icon_name("non-starred-symbolic", Gtk.IconSize.MENU)
+        self.star_btn.set_relief(Gtk.ReliefStyle.NONE)
+        self.star_btn.get_style_context().add_class("sh-star")
+        self.star_btn.set_tooltip_text("Bookmark this page (Ctrl+D)")
+        self.star_btn.set_can_focus(False)
+        self.star_btn.connect("clicked", lambda *_: self.bookmark_page())
+        self.urlbox.pack_start(self.star_btn, False, False, 0)
         self.copy_btn = Gtk.Button.new_from_icon_name("edit-copy-symbolic", Gtk.IconSize.MENU)
         self.copy_btn.set_relief(Gtk.ReliefStyle.NONE)
         self.copy_btn.get_style_context().add_class("sh-copy")
@@ -1076,6 +1138,14 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
         self.zoom_btn.connect("clicked", lambda *_: self.zoom(0))
         self.zoom_btn.set_no_show_all(True)
         bar.pack_start(self.zoom_btn, False, False, 0)
+
+        self.bm_btn = Gtk.MenuButton()
+        self.bm_btn.set_relief(Gtk.ReliefStyle.NONE)
+        self.bm_btn.set_tooltip_text("Bookmarks (Ctrl+Shift+O)")
+        self.bm_btn.add(Gtk.Image.new_from_icon_name("user-bookmarks-symbolic", Gtk.IconSize.BUTTON))
+        self.bm_btn.set_popover(self.build_bm_popover())
+        self.bm_btn.connect("toggled", lambda b: b.get_active() and self.open_bm_list())
+        bar.pack_start(self.bm_btn, False, False, 0)
 
         self.shield = Gtk.MenuButton()
         self.shield.set_relief(Gtk.ReliefStyle.NONE)
@@ -1388,6 +1458,7 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
             return
         if hasattr(self, "copy_btn"):
             self.copy_btn.set_sensitive(bool(self.current.display_uri()))
+            self.update_star()
         if self.editing:
             return
         self.url.set_text(self.current.display_uri())
@@ -1502,6 +1573,171 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
             return False
         self._toast_t = GLib.timeout_add_seconds(seconds, end)
 
+    # -- bookmarks
+    def bookmarkable(self):
+        uri = self.current.uri if self.current else ""
+        return uri if is_web(uri) else ""
+
+    def update_star(self):
+        uri = self.bookmarkable()
+        on = self.app.saved.has(uri)
+        self.star_btn.set_sensitive(bool(uri))
+        self.star_btn.get_image().set_from_icon_name("starred-symbolic" if on else "non-starred-symbolic", Gtk.IconSize.MENU)
+        self.star_btn.set_tooltip_text("Edit bookmark (Ctrl+D)" if on else "Bookmark this page (Ctrl+D)")
+        ctx = self.star_btn.get_style_context()
+        (ctx.add_class if on else ctx.remove_class)("sh-starred")
+
+    def on_bookmarks_changed(self):
+        self.update_star()
+        if self.bm_pop.get_visible():
+            self.fill_bm_list()
+
+    def build_star_popover(self):
+        pop = Gtk.Popover(relative_to=self.star_btn, position=Gtk.PositionType.BOTTOM)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.get_style_context().add_class("sh-pop")
+        head = Gtk.Label(xalign=0)
+        head.set_markup("<b>Bookmarked</b>")
+        box.pack_start(head, False, False, 0)
+        self.star_title = Gtk.Entry(width_chars=34, placeholder_text="Name")
+        self.star_title.connect("activate", lambda *_: pop.popdown())
+        box.pack_start(self.star_title, False, False, 0)
+        self.star_addr = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.MIDDLE, max_width_chars=40)
+        self.star_addr.get_style_context().add_class("dim-label")
+        box.pack_start(self.star_addr, False, False, 0)
+        row = Gtk.Box(spacing=6)
+        rm = Gtk.Button(label="Remove")
+        rm.connect("clicked", lambda *_: (self.app.saved.remove(self._star_uri), pop.popdown()))
+        done = Gtk.Button(label="Done")
+        done.get_style_context().add_class("suggested-action")
+        done.connect("clicked", lambda *_: pop.popdown())
+        row.pack_end(done, False, False, 0)
+        row.pack_end(rm, False, False, 0)
+        box.pack_start(row, False, False, 0)
+        box.show_all()
+        pop.add(box)
+        self._star_uri = ""
+        pop.connect("closed", self.on_star_closed)
+        self.star_pop = pop
+
+    def on_star_closed(self, *_):
+        if self._star_uri and self.app.saved.has(self._star_uri):
+            self.app.saved.rename(self._star_uri, self.star_title.get_text())
+        self._star_uri = ""
+        if self.view:
+            self.view.grab_focus()
+
+    def bookmark_page(self):
+        """Ctrl+D or the star: saves the page (if it isn't already) and offers to name or remove it."""
+        uri = self.bookmarkable()
+        if not uri:
+            self.toast("Only web pages can be bookmarked", 2)
+            return
+        if self.star_pop.get_visible():
+            self.star_pop.popdown()
+            return
+        b = self.app.saved.list.find(uri) or self.app.saved.add(uri, self.current.title)
+        self._star_uri = b["u"]
+        self.star_title.set_text(b.get("ti") or "")
+        self.star_addr.set_text(bookmarks.shown(b["u"]))
+        self.reveal("top")
+        self.star_pop.popup()
+        self.star_title.grab_focus()
+
+    def build_bm_popover(self):
+        pop = Gtk.Popover()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.get_style_context().add_class("sh-pop")
+        self.bm_search = Gtk.SearchEntry(placeholder_text="Search bookmarks")
+        self.bm_search.connect("search-changed", lambda *_: self.fill_bm_list())
+        self.bm_search.connect("activate", lambda *_: self.open_bm_row(self.bm_listbox.get_row_at_index(0)))
+        box.pack_start(self.bm_search, False, False, 0)
+        self.bm_listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.BROWSE, activate_on_single_click=True)
+        self.bm_listbox.connect("row-activated", lambda lb, row: self.open_bm_row(row))
+        self.bm_listbox.connect("button-press-event", self.on_bm_button)
+        sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, propagate_natural_height=True,
+                                max_content_height=440, min_content_width=380)
+        sc.add(self.bm_listbox)
+        box.pack_start(sc, True, True, 0)
+        self.bm_empty = Gtk.Label(wrap=True, max_width_chars=40, xalign=0)
+        self.bm_empty.get_style_context().add_class("dim-label")
+        self.bm_empty.set_no_show_all(True)
+        box.pack_start(self.bm_empty, False, False, 0)
+        tip = Gtk.Label(label="Middle-click or Ctrl+click opens in a new tab", xalign=0)
+        tip.get_style_context().add_class("dim-label")
+        box.pack_start(tip, False, False, 0)
+        box.show_all()
+        pop.add(box)
+        self.bm_pop = pop
+        return pop
+
+    def bm_row(self, b):
+        row = Gtk.ListBoxRow()
+        row.uri = b["u"]
+        h = Gtk.Box(spacing=8)
+        h.get_style_context().add_class("sh-bm-row")
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        t = Gtk.Label(label=self.app.saved.list.title_of(b), xalign=0, ellipsize=Pango.EllipsizeMode.END, max_width_chars=44)
+        u = Gtk.Label(label=bookmarks.shown(b["u"]), xalign=0, ellipsize=Pango.EllipsizeMode.MIDDLE, max_width_chars=48)
+        u.get_style_context().add_class("dim-label")
+        col.pack_start(t, False, False, 0)
+        col.pack_start(u, False, False, 0)
+        h.pack_start(col, True, True, 0)
+        rm = Gtk.Button.new_from_icon_name("window-close-symbolic", Gtk.IconSize.MENU)
+        rm.set_relief(Gtk.ReliefStyle.NONE)
+        rm.set_tooltip_text("Remove bookmark")
+        rm.set_valign(Gtk.Align.CENTER)
+        rm.set_can_focus(False)
+        rm.connect("clicked", lambda *_: self.app.saved.remove(b["u"]))
+        h.pack_end(rm, False, False, 0)
+        row.add(h)
+        row.set_tooltip_text(b["u"])
+        return row
+
+    def fill_bm_list(self):
+        for r in self.bm_listbox.get_children():
+            self.bm_listbox.remove(r)
+        found = self.app.saved.list.search(self.bm_search.get_text())
+        for b in found:
+            self.bm_listbox.add(self.bm_row(b))
+        self.bm_listbox.show_all()
+        first = self.bm_listbox.get_row_at_index(0)
+        if first:
+            self.bm_listbox.select_row(first)
+        if not self.app.saved.list.items:
+            self.bm_empty.set_text("No bookmarks yet. Press Ctrl+D or the star in the address bar to save a page.")
+        elif not found:
+            self.bm_empty.set_text("No bookmarks match.")
+        self.bm_empty.set_visible(not found)
+        self.bm_listbox.get_parent().get_parent().set_visible(bool(found))
+
+    def open_bm_list(self):
+        self.bm_search.set_text("")
+        self.fill_bm_list()
+        self.bm_search.grab_focus()
+
+    def show_bookmarks(self):
+        if self.page_fullscreen:
+            return
+        self.reveal("top")
+        self.bm_btn.set_active(not self.bm_btn.get_active())
+
+    def on_bm_button(self, lb, ev):
+        if ev.type != Gdk.EventType.BUTTON_PRESS:
+            return False
+        row = lb.get_row_at_y(int(ev.y))
+        if row and (ev.button == 2 or (ev.button == 1 and ev.state & Gdk.ModifierType.CONTROL_MASK)):
+            self.new_tab(row.uri, background=True)
+            self.toast("Opened in a new tab", 2)
+            return True
+        return False
+
+    def open_bm_row(self, row):
+        if not row:
+            return
+        self.bm_pop.popdown()
+        self.go(row.uri)
+
     # -- address bar
     def on_url_focus(self, *_):
         GLib.idle_add(lambda: self.url.select_region(0, -1) and False)
@@ -1606,7 +1842,7 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
                 "minus": lambda: self.zoom(-1), "KP_Subtract": lambda: self.zoom(-1),
                 "0": lambda: self.zoom(0), "KP_0": lambda: self.zoom(0),
                 "Tab": lambda: self.cycle(1), "Page_Down": lambda: self.cycle(1), "Page_Up": lambda: self.cycle(-1),
-                "s": self.save_page,
+                "s": self.save_page, "d": self.bookmark_page,
             }.get(name)
             if act:
                 act()
@@ -1627,7 +1863,7 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
                 "g": lambda: self.find_step(-1), "w": self.close,
                 "Page_Up": lambda: self.move_tab(-1), "Page_Down": lambda: self.move_tab(1),
                 "plus": lambda: self.zoom(1), "equal": lambda: self.zoom(1),
-                "m": lambda: self.play_in_mpv(),
+                "m": lambda: self.play_in_mpv(), "o": self.show_bookmarks,
             }.get(name)
             if act:
                 act()
@@ -1909,7 +2145,9 @@ class App(Gtk.Application):
         os.makedirs(CACHE, exist_ok=True)
         self.prefs = Store("prefs.json", {"engine": "google", "restore": True, "block": True,
                                           "allow": [], "zoom": {}, "perms": {}, "session": []})
-        self.history = History()
+        self.saved = SavedBookmarks()
+        self.saved.listeners.append(lambda: self.history.soon())
+        self.history = History(self.saved)
         self.downloads = Downloads(self)
         self.settings = WebKit2.Settings(
             enable_developer_extras=True, enable_back_forward_navigation_gestures=True,
@@ -2002,6 +2240,8 @@ class App(Gtk.Application):
         act("private-window", lambda: self.new_window(private=True))
         act("reopen", lambda: win() and win().reopen_closed())
         act("find", lambda: win() and win().open_find())
+        act("bookmark", lambda: win() and win().bookmark_page())
+        act("bookmarks", lambda: win() and win().show_bookmarks())
         act("zoom-in", lambda: win() and win().zoom(1))
         act("zoom-out", lambda: win() and win().zoom(-1))
         act("zoom-reset", lambda: win() and win().zoom(0))
@@ -2044,6 +2284,8 @@ class App(Gtk.Application):
         s1.append("Reopen closed tab\tCtrl+Shift+T", "app.reopen")
         m.append_section(None, s1)
         s2 = Gio.Menu()
+        s2.append("Bookmark this page\tCtrl+D", "app.bookmark")
+        s2.append("Bookmarks\tCtrl+Shift+O", "app.bookmarks")
         s2.append("Find on page\tCtrl+F", "app.find")
         zoom = Gio.Menu()
         zoom.append("Zoom in\tCtrl+=", "app.zoom-in")

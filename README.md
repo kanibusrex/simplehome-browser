@@ -53,6 +53,8 @@ Both parts can be turned off in the menu under 1Password. Passkeys, cards and ad
 
 **Play in mpv.** On a slow computer YouTube's watch page can spend 10–20 seconds running its own script (building the suggestions and comments) before the video settles. Right-click a YouTube link and choose Play Link in mpv, or press Ctrl+Shift+M on a video's page, and the video opens in mpv instead, in a few seconds, decoded by the graphics chip. From the page it picks up where the video was and pauses the page's copy, so the tab stays open for the comments. It asks for H.264 (or VP9) up to 1080p, never AV1, which older graphics chips can't decode. If mpv can't play a video (age-restricted or members-only, say) the corner of the window says why; mpv's output is in `~/.cache/simplehome-browser/mpv.log`. Needs `mpv` and `yt-dlp`.
 
+**Bookmarks.** Press Ctrl+D or click the star at the end of the address bar to bookmark the page. A small box opens where you can rename it or remove it again; the star is filled on any page you've bookmarked. The bookmarks button next to the shield (or Ctrl+Shift+O) lists them newest first, with a search box: click one to open it, middle-click or Ctrl+click to open it in a new tab, or click × to delete it. Bookmarks also come first in the address bar's suggestions, marked with ★. Private windows can save bookmarks too, since saving one is something you do on purpose.
+
 **Private windows.** Ctrl+Shift+N opens a window that keeps nothing: no history, no cookies, no site data, no saved permissions.
 
 **Downloads.** Files go to `~/Downloads`. A name that's already taken gets `(2)` added. A finished download sends a notification, and the downloads button lists recent downloads with Open and Show in folder.
@@ -75,6 +77,7 @@ Both parts can be turned off in the menu under 1Password. Passkeys, cards and ad
 | Alt+Left / Alt+Right, mouse back/forward | Back / forward |
 | Alt+Home | SimpleHome |
 | Ctrl+F, Ctrl+G / Ctrl+Shift+G | Find, next / previous match |
+| Ctrl+D / Ctrl+Shift+O | Bookmark this page / show bookmarks |
 | Ctrl+Shift+L | Fill from 1Password |
 | Ctrl+Shift+M | Play this YouTube video in mpv |
 | Ctrl+= / Ctrl+- / Ctrl+0 | Zoom in / out / reset (remembered per site) |
@@ -94,7 +97,7 @@ SimpleHome's own keys still work on the new tab page: Alt+1–9 opens a tile, an
 
 ## Where things are kept
 
-- `~/.local/share/simplehome-browser/` — `prefs.json` (session, zoom, permissions, blocking choices), `history.json`, and `web/` (cookies and site storage, including SimpleHome's).
+- `~/.local/share/simplehome-browser/` — `prefs.json` (session, zoom, permissions, blocking choices), `history.json`, `bookmarks.json`, and `web/` (cookies and site storage, including SimpleHome's).
 - `~/.cache/simplehome-browser/` — downloaded filter lists, the compiled blocker, favicons and the web cache.
 
 Set `SIMPLEHOME_DEBUG=1` to print what the blocker is doing. Set `SIMPLEHOME_OP` to use a different `op` binary (the tests use a stand-in). Set `SIMPLEHOME_DATA`, `SIMPLEHOME_CACHE` and `SIMPLEHOME_APP_ID` to run a separate test copy next to your real one.
