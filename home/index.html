@@ -2215,9 +2215,11 @@
   @keyframes clock-roll {
     from { transform: translateY(-0.28em); opacity: 0; filter: blur(6px); }
   }
+  /* A soft brighten, no movement: the seconds change every second, so any
+     offset here reads as the digits jumping. */
   .clock-secs.tick { animation: clock-sec 0.45s ease-out; }
   @keyframes clock-sec {
-    from { opacity: 0.35; transform: translateY(-3px); }
+    from { opacity: 0.6; }
   }
 
   /* Opt back out of the parent's gradient fill so these paint their own color
