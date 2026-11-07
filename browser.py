@@ -28,9 +28,10 @@ sys.path.insert(0, HERE)
 import adblock  # noqa: E402
 import bookmarks  # noqa: E402
 import mpvplay  # noqa: E402
+import onscreen  # noqa: E402
 import passwords  # noqa: E402
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 APP_ID = "dev.simplehome.Browser"
 NAME = "SimpleHome Browser"
 DESKTOP_ID = "simplehome-browser.desktop"
@@ -47,6 +48,12 @@ ENGINES = {
     "bing": ("Bing", "https://www.bing.com/search?q="),
 }
 SLEEP_CHOICES = [(5, "After 5 minutes"), (10, "After 10 minutes"), (30, "After 30 minutes"), (0, "Never")]
+# a background tab using at least BUSY_CPU of a core for BUSY_SAMPLES checks in a row (30 s each)
+# goes to sleep then, without waiting out the sleep timer
+BUSY_CPU = 0.10
+BUSY_SAMPLES = 2
+EXT_DIR = os.path.join(HERE, "ext")  # simplehome-pid.so: tells each tab its process ID
+CLK_TCK = os.sysconf("SC_CLK_TCK")
 ZOOMS = [0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0]
 
 
@@ -64,6 +71,33 @@ def host_of(uri):
 
 def is_web(uri):
     return bool(uri) and uri.startswith(("http://", "https://"))
+
+
+def cpu_ticks(pid):
+    """utime + stime of a process, or None once it's gone."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+        return int(fields[11]) + int(fields[12])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def memory_settings():
+    """Make each page's process give memory back sooner than WebKit's default (it starts at
+    1 GB of a 3 GB limit, which a single tab on an 8 GB machine never reaches). The limit is a
+    sixth of the RAM, 768 MB to 3 GB: caches are dropped from a third of it, harder from half.
+    Nothing is ever killed."""
+    try:
+        ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") // (1024 * 1024)
+    except (ValueError, OSError):
+        ram = 8192
+    mps = WebKit2.MemoryPressureSettings.new()
+    mps.set_memory_limit(max(768, min(3072, ram // 6)))
+    mps.set_conservative_threshold(0.33)
+    mps.set_strict_threshold(0.5)
+    mps.set_poll_interval(15)
+    return mps
 
 
 def site_of(host):
@@ -525,6 +559,9 @@ class Tab:
         self.asleep = False  # its page process shut down to save memory and CPU; wakes when shown
         self.shares_process = False  # opened with or by window.open: one process for both tabs
         self.hidden_since = time.time()
+        self.pid = None  # the page's process, reported by the web extension
+        self.cpu_mark = None  # (ticks, time) at the last check
+        self.busy = 0  # checks in a row this tab used the CPU while hidden
         self.title = "New tab"
         self.zoom_set = False
         # the notebook only draws the tab strip; the page itself lives in the window's stack
@@ -565,6 +602,7 @@ class Tab:
         view.connect("load-failed-with-tls-errors", self.on_tls)
         view.connect("web-process-terminated", self.on_crash)
         view.connect("context-menu", self.on_context_menu)
+        view.connect("user-message-received", self.on_user_message)
         view.connect("mouse-target-changed", self.on_hover)
         view.connect("button-press-event", self.on_button)
         view.connect("motion-notify-event", lambda v, ev: win.on_page_motion(v, ev))
@@ -771,9 +809,37 @@ class Tab:
             return False
         return time.time() - self.hidden_since > minutes * 60
 
+    def on_user_message(self, view, msg):
+        if msg.get_name() != "sh-pid":
+            return False
+        pid = msg.get_parameters().get_int32()
+        if pid != self.pid:
+            self.pid, self.cpu_mark, self.busy = pid, None, 0
+        return True
+
+    def check_cpu(self, shared):
+        """Measure the page's process since the last check. True once it's been busy in the
+        background long enough to put to sleep early."""
+        if not self.pid or self.asleep:
+            return False
+        ticks, now = cpu_ticks(self.pid), time.time()
+        mark, self.cpu_mark = self.cpu_mark, (ticks, now) if ticks is not None else None
+        if ticks is None:
+            self.pid = None
+            return False
+        # only a stretch spent wholly in the background counts
+        if not mark or self is self.win.current or self.hidden_since > mark[1] or self.pid in shared:
+            self.busy = 0
+            return False
+        use = (ticks - mark[0]) / CLK_TCK / max(now - mark[1], 0.001)
+        self.busy = self.busy + 1 if use >= BUSY_CPU else 0
+        log("cpu", f"{use:.0%}", "busy" if self.busy else "", self.uri)
+        return self.busy >= BUSY_SAMPLES
+
     def sleep(self):
         """End the page's process; the tab keeps its title, icon and history."""
         log("sleeping", self.uri)
+        self.pid, self.cpu_mark, self.busy = None, None, 0
         self.sleep_uri = self.uri  # the view forgets its address once the process is gone
         self.asleep = True
         self.head.get_style_context().add_class("sh-asleep")
@@ -796,6 +862,7 @@ class Tab:
     def on_crash(self, view, reason):
         uri = self.uri
         log("web process ended", uri, reason)
+        self.pid, self.cpu_mark, self.busy = None, None, 0
         if self.asleep:
             return  # we ended it ourselves
         # a one-off: load it again by itself; a page that keeps dying gets the message instead
@@ -881,7 +948,9 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
         self.layout(app.prefs.data.get("vertical_tabs", True))
         self.connect("key-press-event", self.on_key)
         self.connect("delete-event", self.on_delete)
-        self.connect("notify::is-active", lambda *_: self.is_active() and app.focused(self))
+        self.connect("notify::is-active", lambda *_: self.is_active() and (self.unpark(), app.focused(self)))
+        self.parked = False  # page hidden while Hyprland isn't showing this window
+        self._park_t = 0
         self.app.blocker.listeners.append(self.update_shield)
         self.findbar.set_reveal_child(False)
 
@@ -1371,6 +1440,7 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
         tab = next((t for t in self.tabs if t.slot is slot), None)
         if not tab:
             return
+        self.unpark()
         if self.current and self.current is not tab:
             self.current.hidden_since = time.time()
         self.current = tab
@@ -1737,6 +1807,36 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
             return
         self.bm_pop.popdown()
         self.go(row.uri)
+
+    # -- off screen
+    def set_onscreen(self, on):
+        """Hyprland's word on whether this window is showing. Off screen for 2 s, the page is
+        hidden (the stack, so no other tab gets shown instead), which makes WebKit tell it
+        document.hidden and stop its timers and frames; back on screen, it's shown at once."""
+        if on:
+            self.unpark()
+        elif not self.parked and not self._park_t:
+            self._park_t = GLib.timeout_add(2000, self.park)
+
+    def park(self):
+        self._park_t = 0
+        v = self.view
+        # a page playing sound is left alone, as it would be in a background tab
+        if self.parked or self.is_active() or (v and v.is_playing_audio()):
+            return False
+        log("off screen: hiding the page")
+        self.parked = True
+        self.stack.hide()
+        return False
+
+    def unpark(self):
+        if self._park_t:
+            GLib.source_remove(self._park_t)
+            self._park_t = 0
+        if self.parked:
+            log("on screen again")
+            self.parked = False
+            self.stack.show()
 
     # -- address bar
     def on_url_focus(self, *_):
@@ -2145,6 +2245,7 @@ class App(Gtk.Application):
         os.makedirs(CACHE, exist_ok=True)
         self.prefs = Store("prefs.json", {"engine": "google", "restore": True, "block": True,
                                           "allow": [], "zoom": {}, "perms": {}, "session": []})
+        self.onscreen = onscreen.Watcher(self.check_onscreen)
         self.saved = SavedBookmarks()
         self.saved.listeners.append(lambda: self.history.soon())
         self.history = History(self.saved)
@@ -2196,7 +2297,9 @@ class App(Gtk.Application):
             dm = WebKit2.WebsiteDataManager(base_data_directory=os.path.join(DATA, "web"),
                                             base_cache_directory=os.path.join(CACHE, "web"))
         dm.set_itp_enabled(True)
-        ctx = WebKit2.WebContext.new_with_website_data_manager(dm)
+        ctx = WebKit2.WebContext(website_data_manager=dm, memory_pressure_settings=memory_settings())
+        if os.path.exists(os.path.join(EXT_DIR, "simplehome-pid.so")):
+            ctx.connect("initialize-web-extensions", lambda c: c.set_web_extensions_directory(EXT_DIR))
         if not private:
             ctx.get_cookie_manager().set_persistent_storage(os.path.join(DATA, "web", "cookies.sqlite"),
                                                             WebKit2.CookiePersistentStorage.SQLITE)
@@ -2465,17 +2568,31 @@ class App(Gtk.Application):
         key = self.prefs.data.get("engine", "google")
         return ENGINES.get(key, ENGINES["google"])[1] + urllib.parse.quote_plus(t)
 
+    def check_onscreen(self):
+        titles = self.onscreen.titles(os.getpid())
+        if titles is None:
+            return
+        for w in self.windows():
+            # a title Hyprland hasn't caught up with yet counts as showing
+            w.set_onscreen(titles.get(w.get_title(), True))
+
     def sleep_tabs(self):
         """Background tabs left alone long enough give up their page process (and its memory
         and CPU: a hidden YouTube or news page keeps running at full tilt otherwise)."""
         minutes = self.prefs.data.get("sleep_minutes", 10)
         if os.environ.get("SIMPLEHOME_SLEEP_SECONDS"):
             minutes = float(os.environ["SIMPLEHOME_SLEEP_SECONDS"]) / 60
-        if minutes:
-            for w in self.windows():
-                for t in w.tabs:
-                    if t.can_sleep(minutes):
-                        t.sleep()
+        if not minutes:
+            return True
+        tabs = [t for w in self.windows() for t in w.tabs]
+        seen, shared = set(), set()
+        for t in tabs:
+            if t.pid:
+                (shared if t.pid in seen else seen).add(t.pid)
+        for t in tabs:
+            # one sleeping early still has to pass everything a timed sleep does, bar the wait
+            if t.can_sleep(minutes) or (t.check_cpu(shared) and t.can_sleep(0)):
+                t.sleep()
         return True
 
     def refilter(self, reload_current=None):

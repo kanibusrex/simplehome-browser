@@ -29,6 +29,12 @@ sudo pacman -S mpv yt-dlp                        # optional: Play in mpv
 
 **Sleeping tabs.** A page in a background tab keeps running: a hidden YouTube or news page used 400 to 470 MB and up to 85% of a core on this machine with nothing happening. After 10 minutes in the background, a tab is put to sleep: its page process is ended, and its memory and CPU go with it. The tab keeps its title, icon and back/forward history, shows dimmed, and loads again when you click it. A tab playing sound, the tab in front, and a pop-up sharing its page process with another tab are never put to sleep. Change the time, or turn it off, under "Sleep background tabs" in the menu. In a test with SimpleHome, CNN, YouTube and two plain pages open, sleeping took the browser from 836 MB and 45% CPU at idle to 364 MB and 1%.
 
+A background tab that keeps using the CPU doesn't wait the 10 minutes: one using at least 10% of a core for a minute (two checks, 30 s apart) is put to sleep then. A hidden CNN page used 40% of a core, so it sleeps after about a minute; a quiet page like mail or docs keeps the full wait. WebKit doesn't say which process belongs to which tab, so a small helper loaded into each page's process (`ext/simplehome-pid.so`, built from `ext/pidreport.c`) reports it. Without the helper, tabs sleep by time alone.
+
+**Off-screen windows.** Hyprland keeps a window on a workspace you've left running as if it were on screen, so its page never knows it's hidden and keeps animating: SimpleHome's galaxy theme used half a core there. The browser listens to Hyprland, and two seconds after its window leaves the screen (another workspace, a closed special workspace, a hidden group tab, or another window full screen over it) it hides the page, so the page stops its timers and animations. SimpleHome's background went from 52% of a core to 0%. The page is shown again as soon as the window is back. A page playing sound is left alone. This only happens on Hyprland.
+
+**Memory.** Each page's process is told to give memory back sooner than WebKit's default, which only starts at 1 GB, a size a single tab on an 8 GB machine never reaches. Here the limit is a sixth of the RAM (768 MB to 3 GB): caches are dropped from a third of it, harder from half, and nothing is ever killed. A CNN tab settled at 567 MB instead of 621 MB.
+
 **Fast starts.** Restored tabs wait to load until you open them, so only the one in front loads at startup.
 
 **Tabs.** Tabs sit in a column on the left, under the toolbar, with New tab at the top. Long titles get the room a row of tabs never has. To put them back in a row along the top, turn off "Tabs on the side" in the menu. You can drag tabs to reorder them, middle-click one to close it, and scroll the list when it overflows. Your tabs come back the next time you open the browser (you can turn that off in the menu). Links from other apps, and a second launch, open as tabs in the window you used last.
@@ -105,8 +111,9 @@ Set `SIMPLEHOME_DEBUG=1` to print what the blocker is doing. Set `SIMPLEHOME_OP`
 ## Building
 
 ```sh
-python3 -m unittest discover tests   # the filter converter, the 1Password matching and the mpv link parsing
-./build-appimage.sh                  # → dist/SimpleHome-Browser-x86_64.AppImage (needs appimagetool)
+python3 -m unittest discover tests   # filter converter, 1Password matching, mpv links, bookmarks, Hyprland visibility
+ext/build.sh                         # the page-process helper (needs gcc and webkit2gtk-4.1's headers)
+./build-appimage.sh                  # → dist/SimpleHome-Browser-x86_64.AppImage (needs appimagetool; builds the helper too)
 ```
 
 To update the bundled home page, copy SimpleHome's `index.html` into `home/` and write its commit into `home/SOURCE`.
