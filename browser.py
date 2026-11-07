@@ -31,7 +31,7 @@ import mpvplay  # noqa: E402
 import onscreen  # noqa: E402
 import passwords  # noqa: E402
 
-VERSION = "1.8.3"
+VERSION = "1.8.4"
 APP_ID = "dev.simplehome.Browser"
 NAME = "SimpleHome Browser"
 DESKTOP_ID = "simplehome-browser.desktop"
@@ -71,6 +71,19 @@ def host_of(uri):
 
 def is_web(uri):
     return bool(uri) and uri.startswith(("http://", "https://"))
+
+
+def is_real_file(response):
+    """Is this response a real file worth downloading? WebKit hands over a blank stand-in (no
+    address, status 0) for a cached redirect such as youtube.com -> www.youtube.com, and
+    redirects themselves can carry odd types like application/binary: neither is a download."""
+    uri = response.get_uri() if response else ""
+    if not uri:
+        return False
+    status = response.get_status_code()
+    if is_web(uri) and (status == 0 or 100 <= status < 200 or 300 <= status < 400):
+        return False
+    return True
 
 
 def cpu_ticks(pid):
@@ -724,7 +737,8 @@ class Tab:
             if action.get_frame_name() is None:
                 self.win.app.blocker.apply_to(view.get_user_content_manager(), uri)
         elif kind == WebKit2.PolicyDecisionType.RESPONSE:
-            if not decision.is_mime_type_supported() and decision.is_main_frame_main_resource():
+            if (not decision.is_mime_type_supported() and decision.is_main_frame_main_resource()
+                    and is_real_file(decision.get_response())):
                 decision.download()
                 return True
         return False
