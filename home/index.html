@@ -2215,12 +2215,6 @@
   @keyframes clock-roll {
     from { transform: translateY(-0.28em); opacity: 0; filter: blur(6px); }
   }
-  /* A soft brighten, no movement: the seconds change every second, so any
-     offset here reads as the digits jumping. */
-  .clock-secs.tick { animation: clock-sec 0.45s ease-out; }
-  @keyframes clock-sec {
-    from { opacity: 0.6; }
-  }
 
   /* Opt back out of the parent's gradient fill so these paint their own color
      and the blink animation doesn't fight the background-clip. */
@@ -8556,7 +8550,9 @@ button { font: inherit; color: inherit; }
     var shown = CLOCK_24H ? h : (h % 12 === 0 ? 12 : h % 12);
     setUnit(clockH, CLOCK_24H ? pad2(shown) : String(shown), 'clock-roll');
     setUnit(clockM, pad2(m), 'clock-roll');
-    setUnit(clockS, pad2(s), 'tick');
+    // The seconds change every second, so they don't animate: any motion or
+    // fade on them reads as jumping or blinking.
+    clockS.textContent = pad2(s);
     clockMer.textContent = CLOCK_24H ? '' : (h < 12 ? 'AM' : 'PM');
     clockGhost.textContent = (CLOCK_24H || shown >= 10) ? '88:88' : '8:88';
 
