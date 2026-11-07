@@ -15,6 +15,7 @@ home/           SimpleHome's index.html, bundled as the new tab page (home/SOURC
 ```sh
 sudo pacman -S python-gobject webkit2gtk-4.1     # if they aren't there already
 sudo pacman -S gst-plugin-va                     # video decoded by the graphics chip instead of the CPU
+sudo pacman -S mpv yt-dlp                        # optional: Play in mpv
 ./install.sh SimpleHome-Browser-x86_64.AppImage  # add --default to make it the default browser
 ```
 
@@ -50,6 +51,8 @@ If filling fails, `~/.cache/simplehome-browser/1password.log` records each call 
 
 Both parts can be turned off in the menu under 1Password. Passkeys, cards and addresses aren't filled.
 
+**Play in mpv.** On a slow computer YouTube's watch page can spend 10–20 seconds running its own script (building the suggestions and comments) before the video settles. Right-click a YouTube link and choose Play Link in mpv, or press Ctrl+Shift+M on a video's page, and the video opens in mpv instead, in a few seconds, decoded by the graphics chip. From the page it picks up where the video was and pauses the page's copy, so the tab stays open for the comments. It asks for H.264 (or VP9) up to 1080p, never AV1, which older graphics chips can't decode. If mpv can't play a video (age-restricted or members-only, say) the corner of the window says why; mpv's output is in `~/.cache/simplehome-browser/mpv.log`. Needs `mpv` and `yt-dlp`.
+
 **Private windows.** Ctrl+Shift+N opens a window that keeps nothing: no history, no cookies, no site data, no saved permissions.
 
 **Downloads.** Files go to `~/Downloads`. A name that's already taken gets `(2)` added. A finished download sends a notification, and the downloads button lists recent downloads with Open and Show in folder.
@@ -73,6 +76,7 @@ Both parts can be turned off in the menu under 1Password. Passkeys, cards and ad
 | Alt+Home | SimpleHome |
 | Ctrl+F, Ctrl+G / Ctrl+Shift+G | Find, next / previous match |
 | Ctrl+Shift+L | Fill from 1Password |
+| Ctrl+Shift+M | Play this YouTube video in mpv |
 | Ctrl+= / Ctrl+- / Ctrl+0 | Zoom in / out / reset (remembered per site) |
 | Ctrl+N / Ctrl+Shift+N | New window / new private window |
 | Ctrl+P, Ctrl+S | Print, save the page to Downloads |
@@ -98,7 +102,7 @@ Set `SIMPLEHOME_DEBUG=1` to print what the blocker is doing. Set `SIMPLEHOME_OP`
 ## Building
 
 ```sh
-python3 -m unittest discover tests   # the filter converter and the 1Password matching
+python3 -m unittest discover tests   # the filter converter, the 1Password matching and the mpv link parsing
 ./build-appimage.sh                  # → dist/SimpleHome-Browser-x86_64.AppImage (needs appimagetool)
 ```
 

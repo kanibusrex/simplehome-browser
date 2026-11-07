@@ -26,9 +26,10 @@ from gi.repository import Gdk, Gio, GLib, Gtk, Pango, WebKit2  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import adblock  # noqa: E402
+import mpvplay  # noqa: E402
 import passwords  # noqa: E402
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 APP_ID = "dev.simplehome.Browser"
 NAME = "SimpleHome Browser"
 DESKTOP_ID = "simplehome-browser.desktop"
@@ -670,8 +671,17 @@ class Tab:
             if menu.get_n_items():
                 menu.append(WebKit2.ContextMenuItem.new_separator())
             menu.append(WebKit2.ContextMenuItem.new_from_gaction(act, "Copy Page _Address", None))
+        link = hit.get_link_uri() if hit.context_is_link() else None
+        if link and mpvplay.video_of(link):
+            act = Gio.SimpleAction.new("mpv-link", None)
+            act.connect("activate", lambda *_: self.win.play_in_mpv(link))
+            menu.insert(WebKit2.ContextMenuItem.new_from_gaction(act, "Play Link in _mpv", None), 0)
+            menu.insert(WebKit2.ContextMenuItem.new_separator(), 1)
+        elif mpvplay.video_of(page):
+            act = Gio.SimpleAction.new("mpv-page", None)
+            act.connect("activate", lambda *_: self.win.play_in_mpv())
+            menu.append(WebKit2.ContextMenuItem.new_from_gaction(act, "Play Video in _mpv", None))
         if hit.context_is_link():
-            link = hit.get_link_uri()
             for i, item in enumerate(list(menu.get_items())):
                 if item.get_stock_action() == WebKit2.ContextMenuAction.OPEN_LINK_IN_NEW_WINDOW:
                     menu.remove(item)
@@ -1424,6 +1434,52 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
         Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(uri, -1)
         self.toast("Address copied", 2)
 
+    def play_in_mpv(self, uri=None):
+        """Hand a YouTube video to mpv: a link, or (no uri) the page's own video from where it is."""
+        tab = self.current
+        found = mpvplay.video_of(uri or (tab.display_uri() if tab else ""))
+        if not found:
+            self.toast("Not a YouTube video", 3)
+            return
+        if not mpvplay.available():
+            self.toast("Playing in mpv needs mpv and yt-dlp:  sudo pacman -S mpv yt-dlp", 8)
+            return
+        url, start = found
+        if uri or not tab:
+            self.start_mpv(url, start)
+            return
+
+        def paused(v, r):  # pick up where the page was, and stop it playing underneath
+            try:
+                t = float(v.evaluate_javascript_finish(r).to_string())
+            except (GLib.Error, ValueError):
+                t = -1
+            self.start_mpv(url, t if t >= 1 else start)
+        tab.view.evaluate_javascript("(() => { const v = document.querySelector('video'); if (!v) return -1; "
+                                     "v.pause(); return v.currentTime; })()", -1, None, None, None, paused)
+
+    def start_mpv(self, url, start):
+        log_path = os.path.join(CACHE, "mpv.log")
+        try:
+            proc = mpvplay.launch(url, start, log_path)
+        except OSError as e:
+            self.toast(f"Couldn't start mpv: {e.strerror or e}", 6)
+            return
+        self.toast("Opening in mpv…", 4)
+
+        def ended(pid, status):
+            GLib.spawn_close_pid(pid)
+            proc.returncode = status  # reaped here; keeps Popen from waiting on it again
+            if status != 0 and time.time() - began < 60:
+                try:
+                    text = open(log_path, errors="replace").read()
+                except OSError:
+                    text = ""
+                why = mpvplay.failure(text)
+                self.toast("mpv couldn't play it" + (": " + why[:160] if why else ""), 8)
+        began = time.time()
+        GLib.child_watch_add(GLib.PRIORITY_DEFAULT, proc.pid, ended)
+
     def show_link(self, link):
         if self._toast_t:
             return  # a toast is showing; links can wait
@@ -1571,6 +1627,7 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
                 "g": lambda: self.find_step(-1), "w": self.close,
                 "Page_Up": lambda: self.move_tab(-1), "Page_Down": lambda: self.move_tab(1),
                 "plus": lambda: self.zoom(1), "equal": lambda: self.zoom(1),
+                "m": lambda: self.play_in_mpv(),
             }.get(name)
             if act:
                 act()
