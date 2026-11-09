@@ -31,7 +31,7 @@ import mpvplay  # noqa: E402
 import onscreen  # noqa: E402
 import passwords  # noqa: E402
 
-VERSION = "1.8.4"
+VERSION = "1.9.0"
 APP_ID = "dev.simplehome.Browser"
 NAME = "SimpleHome Browser"
 DESKTOP_ID = "simplehome-browser.desktop"
@@ -47,7 +47,12 @@ ENGINES = {
     "duckduckgo": ("DuckDuckGo", "https://duckduckgo.com/?q="),
     "bing": ("Bing", "https://www.bing.com/search?q="),
 }
-SLEEP_CHOICES = [(5, "After 5 minutes"), (10, "After 10 minutes"), (30, "After 30 minutes"), (0, "Never")]
+SLEEP_NOW = -1  # the sleep_minutes value for "Right away"
+SLEEP_CHOICES = [(SLEEP_NOW, "Right away"), (5, "After 5 minutes"), (10, "After 10 minutes"),
+                 (30, "After 30 minutes"), (0, "Never")]
+# "Right away" still gives a tab you just left a few seconds, so glancing back at it (or Ctrl+Tab
+# going past it) doesn't reload the page each time
+SLEEP_GRACE = int(os.environ.get("SIMPLEHOME_SLEEP_GRACE", "10"))
 # a background tab using at least BUSY_CPU of a core for BUSY_SAMPLES checks in a row (30 s each)
 # goes to sleep then, without waiting out the sleep timer
 BUSY_CPU = 0.10
@@ -572,6 +577,7 @@ class Tab:
         self.asleep = False  # its page process shut down to save memory and CPU; wakes when shown
         self.shares_process = False  # opened with or by window.open: one process for both tabs
         self.hidden_since = time.time()
+        self.sleep_timer = 0  # "Right away": the one-shot check after the tab goes out of sight
         self.pid = None  # the page's process, reported by the web extension
         self.cpu_mark = None  # (ticks, time) at the last check
         self.busy = 0  # checks in a row this tab used the CPU while hidden
@@ -819,9 +825,29 @@ class Tab:
     def can_sleep(self, minutes):
         if self.asleep or self.pending or self.shares_process or self is self.win.current:
             return False
-        if not is_web(self.uri) or self.view.is_playing_audio():
+        if not (is_web(self.uri) or self.uri.startswith(HOME_URI)) or self.view.is_playing_audio():
             return False
-        return time.time() - self.hidden_since > minutes * 60
+        return time.time() - self.hidden_since >= minutes * 60
+
+    def hidden(self):
+        """The tab just went out of sight (another tab came to the front, or it opened behind)."""
+        self.hidden_since = time.time()
+        if self.sleep_timer:
+            GLib.source_remove(self.sleep_timer)
+        self.sleep_timer = 0
+        if self.win.app.sleep_minutes() == SLEEP_NOW:
+            self.sleep_timer = GLib.timeout_add_seconds(SLEEP_GRACE, self.sleep_if_left)
+
+    def shown(self):
+        if self.sleep_timer:
+            GLib.source_remove(self.sleep_timer)
+        self.sleep_timer = 0
+
+    def sleep_if_left(self):
+        self.sleep_timer = 0
+        if self in self.win.tabs and self.can_sleep(SLEEP_GRACE / 60):
+            self.sleep()
+        return False
 
     def on_user_message(self, view, msg):
         if msg.get_name() != "sh-pid":
@@ -1462,6 +1488,8 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
             self.notebook.set_current_page(self.notebook.page_num(tab.slot))
             if uri == HOME_URI:
                 view.grab_focus()
+        elif not lazy:
+            tab.hidden()  # opened behind: it loads, then sleeps until you look at it
         self.notebook.set_show_tabs(True)
         return tab
 
@@ -1475,8 +1503,9 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
             return
         self.unpark()
         if self.current and self.current is not tab:
-            self.current.hidden_since = time.time()
+            self.current.hidden()
         self.current = tab
+        tab.shown()
         self.stack.set_visible_child(tab.view)
         tab.wake()
         if hasattr(self, "_in") and self.vertical and not self._in["side"] and not getattr(self, "restoring", False):
@@ -1505,6 +1534,7 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
             self.closed = self.closed[-25:]
             self.app.closed_any = (self, self.closed)
         self.tabs.remove(tab)
+        tab.shown()  # drops a pending sleep check
         if len(self.tabs) == 0:
             self.save_session(final=True)
             self.destroy()
@@ -2402,7 +2432,7 @@ class App(Gtk.Application):
         ah.connect("activate", self.on_autohide)
         self.add_action(ah)
         sl = Gio.SimpleAction.new_stateful("sleep", GLib.VariantType.new("s"),
-                                           GLib.Variant("s", str(self.prefs.data.get("sleep_minutes", 10))))
+                                           GLib.Variant("s", str(self.prefs.data.get("sleep_minutes", SLEEP_NOW))))
         sl.connect("activate", self.on_sleep_choice)
         self.add_action(sl)
         side = Gio.SimpleAction.new_stateful("vertical-tabs", None, GLib.Variant("b", self.prefs.data.get("vertical_tabs", True)))
@@ -2485,6 +2515,12 @@ class App(Gtk.Application):
         a.set_state(v)
         self.prefs.data["sleep_minutes"] = int(v.get_string())
         self.prefs.changed()
+        # tabs already out of sight follow the new choice from now
+        if int(v.get_string()) == SLEEP_NOW:
+            for w in self.windows():
+                for t in w.tabs:
+                    if t is not w.current:
+                        t.hidden()
 
     def on_autohide(self, a, _v):
         on = not a.get_state().get_boolean()
@@ -2609,12 +2645,19 @@ class App(Gtk.Application):
             # a title Hyprland hasn't caught up with yet counts as showing
             w.set_onscreen(titles.get(w.get_title(), True))
 
+    def sleep_minutes(self):
+        if os.environ.get("SIMPLEHOME_SLEEP_SECONDS"):
+            return float(os.environ["SIMPLEHOME_SLEEP_SECONDS"]) / 60
+        return self.prefs.data.get("sleep_minutes", SLEEP_NOW)
+
     def sleep_tabs(self):
         """Background tabs left alone long enough give up their page process (and its memory
         and CPU: a hidden YouTube or news page keeps running at full tilt otherwise)."""
-        minutes = self.prefs.data.get("sleep_minutes", 10)
-        if os.environ.get("SIMPLEHOME_SLEEP_SECONDS"):
-            minutes = float(os.environ["SIMPLEHOME_SLEEP_SECONDS"]) / 60
+        minutes = self.sleep_minutes()
+        if minutes == SLEEP_NOW:
+            # the per-tab check does the work; this catches the rest (a tab that was playing
+            # sound when it went out of sight, say)
+            minutes = SLEEP_GRACE / 60
         if not minutes:
             return True
         tabs = [t for w in self.windows() for t in w.tabs]
