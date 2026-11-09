@@ -259,8 +259,14 @@ def parse_cosmetic(line):
     return {"hide": hide, "selector": sel, "domains": inc, "not_domains": exc}
 
 
-def build(texts, allowlist=()):
-    """Filter list texts -> (WebKit rules, stats). allowlist: hosts where nothing is blocked."""
+def build(texts, allowlist=(), generic_hide=True):
+    """Filter list texts -> (WebKit rules, stats). allowlist: hosts where nothing is blocked.
+
+    generic_hide=False leaves out the hiding rules meant for every site ('##.ad-box'). WebKit
+    puts those into one style sheet that every page and frame has to parse and match: with
+    EasyList and Annoyances that is ~40,000 selectors, and on an Atom it delayed the first
+    paint of every page by about a second (BBC's home page fought it for 10 s more). The ads
+    themselves are still blocked at the network level, and the per-site hiding stays."""
     blocks, important, allows = [], [], []
     domains = set()
     generic, generic_except = set(), {}
@@ -324,6 +330,9 @@ def build(texts, allowlist=()):
                        "action": {"type": "block"}})
 
     hide = []
+    stats["generic_left_out"] = 0 if generic_hide else len(generic)
+    if not generic_hide:
+        generic = set()
     plain_generic = sorted(s for s in generic if s not in generic_except)
     for i in range(0, len(plain_generic), SELECTORS_PER_RULE):
         hide.append({"trigger": {"url-filter": ".*"},

@@ -31,7 +31,7 @@ import mpvplay  # noqa: E402
 import onscreen  # noqa: E402
 import passwords  # noqa: E402
 
-VERSION = "1.9.1"
+VERSION = "1.10.0"
 APP_ID = "dev.simplehome.Browser"
 NAME = "SimpleHome Browser"
 DESKTOP_ID = "simplehome-browser.desktop"
@@ -72,6 +72,25 @@ def host_of(uri):
         return (urllib.parse.urlsplit(uri or "").hostname or "").lower()
     except ValueError:
         return ""
+
+
+def origin_of(uri):
+    """'https://a.com:8443/x?y' -> 'https://a.com:8443', or '' for anything not http(s)."""
+    try:
+        u = urllib.parse.urlsplit(uri or "")
+    except ValueError:
+        return ""
+    return f"{u.scheme}://{u.netloc}".lower() if u.scheme in ("http", "https") and u.hostname else ""
+
+
+# A hint in the page that WebKit acts on like any <link rel=preconnect>: DNS, TCP and TLS for the
+# site get done now, so opening it later skips them (measured: first byte 35-150 ms after a hint,
+# 190-380 ms without). Nothing is requested from the site and no cookies go out. Added from an
+# isolated world, and removed again once WebKit has picked it up.
+PRECONNECT_JS = """(() => { const l = document.createElement('link'); l.rel = 'preconnect'; l.href = %s;
+(document.head || document.documentElement).appendChild(l); setTimeout(() => l.remove(), 5000); })()"""
+PRECONNECT_WORLD = "simplehome-preconnect"
+HOVER_WARM_MS = 150  # a link hovered this long gets its site connected (a passing mouse doesn't)
 
 
 def is_web(uri):
@@ -267,11 +286,14 @@ class Blocker:
     """Keeps the compiled WebKit content blocker up to date and hands it to every tab."""
     ID = "simplehome-lists"
     MAX_AGE = 24 * 3600
+    MAX_WAIT = 1500  # ms a first page waits for the stored filter at most
 
     def __init__(self, app):
         self.app = app
         self.prefs = app.prefs
         self.filter = None
+        self.loaded = False  # the stored filter has been read (or found missing)
+        self.waiting = []
         self.busy = False
         self.status = "Loading filter lists…"
         self.store = WebKit2.UserContentFilterStore.new(os.path.join(CACHE, "filters"))
@@ -281,6 +303,11 @@ class Blocker:
     @property
     def enabled(self):
         return self.prefs.data.get("block", True)
+
+    @property
+    def hide_everywhere(self):
+        """Also apply the lists' hiding rules meant for every site (slow; off by default)."""
+        return bool(self.prefs.data.get("hide_everywhere", False))
 
     def wanted(self):
         on = self.prefs.data.get("lists")
@@ -310,6 +337,23 @@ class Blocker:
         for cb in list(self.listeners):
             cb()
 
+    def when_ready(self, uri, cb):
+        """Run cb now, or once the stored filter is read if a web page would otherwise start
+        without it. That only happens right after launch (a link opened from another app
+        starts the browser and loads at once), and the page then loaded with every ad and
+        tracker. Never waits more than MAX_WAIT."""
+        if self.loaded or not self.enabled or not is_web(uri) or self.is_off_for(host_of(uri)):
+            cb()
+            return
+        if not self.waiting:
+            GLib.timeout_add(self.MAX_WAIT, lambda: self.release() and False)
+        self.waiting.append(cb)
+
+    def release(self):
+        waiting, self.waiting = self.waiting, []
+        for cb in waiting:
+            cb()
+
     def start(self):
         self.store.load(self.ID, None, self._loaded)
         GLib.timeout_add_seconds(6 * 3600, lambda: (self.update(), True)[1])
@@ -319,12 +363,16 @@ class Blocker:
             self.filter = store.load_finish(res)
         except GLib.Error:
             self.filter = None
+        self.loaded = True
         info = self.prefs.data.get("blockinfo") or {}
         if self.filter:
             self.status = self.describe(info)
             self.app.refilter()
+        self.release()
         stale = time.time() - info.get("when", 0) > self.MAX_AGE
-        if not self.filter or stale or info.get("lists") != sorted(self.wanted()):
+        # a filter from before 1.10 has every-site hiding in it ("generic" missing)
+        if (not self.filter or stale or info.get("lists") != sorted(self.wanted())
+                or info.get("generic", True) != self.hide_everywhere):
             # give the first page a head start before the heavy lifting
             GLib.timeout_add_seconds(3 if self.filter else 1, lambda: self.update() and False)
         self.notify()
@@ -345,10 +393,10 @@ class Blocker:
         self.status = "Updating filter lists…"
         self.notify()
         keys = self.wanted()
-        threading.Thread(target=self._fetch_and_build, args=(keys, force), daemon=True).start()
+        threading.Thread(target=self._fetch_and_build, args=(keys, force, self.hide_everywhere), daemon=True).start()
         return True
 
-    def _fetch_and_build(self, keys, force):
+    def _fetch_and_build(self, keys, force, generic):
         os.makedirs(self.lists_dir, exist_ok=True)
         texts, failed = [], []
         for k in keys:
@@ -376,11 +424,12 @@ class Blocker:
             GLib.idle_add(self._done, None, "Couldn't download the filter lists" + (f" ({', '.join(failed)})" if failed else ""))
             return
         t = time.time()
-        rules, stats = adblock.build(texts)
-        log("built", stats["rules"], "rules in", round(time.time() - t, 1), "s")
-        GLib.idle_add(self._validate, rules, keys, failed)
+        rules, stats = adblock.build(texts, generic_hide=generic)
+        log("built", stats["rules"], "rules in", round(time.time() - t, 1), "s;",
+            stats["generic_left_out"], "every-site hiding selectors left out")
+        GLib.idle_add(self._validate, rules, keys, failed, generic)
 
-    def _validate(self, rules, keys, failed):
+    def _validate(self, rules, keys, failed, generic):
         """WebKit skips a whole selector list over one selector it can't parse, so find those
         first with WebKit's own parser, in a page no one sees."""
         sels = set()
@@ -400,7 +449,7 @@ class Blocker:
             self._check_view = v._keep = None
             v.terminate_web_process()
             v.destroy()
-            threading.Thread(target=self._compile, args=(rules, bad, keys, failed), daemon=True).start()
+            threading.Thread(target=self._compile, args=(rules, bad, keys, failed, generic), daemon=True).start()
 
         def loaded(v, ev):
             if ev == WebKit2.LoadEvent.FINISHED:
@@ -412,12 +461,12 @@ class Blocker:
         self._check_view = view
         return False
 
-    def _compile(self, rules, bad, keys, failed):
+    def _compile(self, rules, bad, keys, failed, generic):
         rules = adblock.drop_selectors(rules, bad)
         data = GLib.Bytes.new(json.dumps(rules, separators=(",", ":")).encode())
-        GLib.idle_add(self._save, data, len(rules), keys, failed)
+        GLib.idle_add(self._save, data, len(rules), keys, failed, generic)
 
-    def _save(self, data, count, keys, failed):
+    def _save(self, data, count, keys, failed, generic):
         t = time.time()
 
         def saved(store, res):
@@ -427,13 +476,13 @@ class Blocker:
                 self._done(None, "Couldn't compile the filter lists: " + e.message)
                 return
             log("compiled in", round(time.time() - t, 1), "s")
-            info = {"when": time.time(), "rules": count, "lists": sorted(keys)}
+            info = {"when": time.time(), "rules": count, "lists": sorted(keys), "generic": generic}
             self.prefs.data["blockinfo"] = info
             self.prefs.changed()
             self._done(self.filter, self.describe(info) + (f" · couldn't refresh {', '.join(failed)}" if failed else ""))
         if not keys:
             self.store.remove(self.ID, None, lambda s, r: None)
-            self.prefs.data["blockinfo"] = {"when": time.time(), "rules": 0, "lists": []}
+            self.prefs.data["blockinfo"] = {"when": time.time(), "rules": 0, "lists": [], "generic": generic}
             self.filter = None
             self._done(None, "No lists turned on")
             return False
@@ -584,6 +633,8 @@ class Tab:
         self.pid = None  # the page's process, reported by the web extension
         self.cpu_mark = None  # (ticks, time) at the last check
         self.busy = 0  # checks in a row this tab used the CPU while hidden
+        self.warmed = {}  # origin -> when this page last hinted a preconnect to it
+        self.hover_t = 0
         self.title = "New tab"
         self.zoom_set = False
         # the notebook only draws the tab strip; the page itself lives in the window's stack
@@ -764,7 +815,34 @@ class Tab:
         return tab.view
 
     def on_hover(self, view, hit, mods):
-        self.win.show_link(hit.get_link_uri() if hit.context_is_link() else "")
+        link = hit.get_link_uri() if hit.context_is_link() else ""
+        self.win.show_link(link)
+        if self.hover_t:
+            GLib.source_remove(self.hover_t)
+            self.hover_t = 0
+        if link and is_web(link):
+            def dwell():
+                self.hover_t = 0
+                self.preconnect(link)
+                return False
+            self.hover_t = GLib.timeout_add(HOVER_WARM_MS, dwell)
+
+    def preconnect(self, uri):
+        """Get a connection to uri's site ready ahead of a likely visit (see PRECONNECT_JS).
+        Falls back to looking up the name when this page can't take the hint."""
+        origin = origin_of(uri)
+        if not origin or origin == origin_of(self.uri):
+            return  # not a web address, or the page's own site, which is connected already
+        now = time.monotonic()
+        if now - self.warmed.get(origin, -999) < 30:
+            return
+        if len(self.warmed) > 200:
+            self.warmed.clear()
+        self.warmed[origin] = now
+        if self.asleep or self.pending or not is_web(self.view.get_uri() or "") and not self.uri.startswith(HOME_URI):
+            self.win.app.prefetch(uri, self.private)
+            return
+        self.view.evaluate_javascript(PRECONNECT_JS % json.dumps(origin), -1, PRECONNECT_WORLD, None, None, None)
 
     def on_button(self, view, ev):
         if ev.type == Gdk.EventType.BUTTON_PRESS and ev.button in (8, 9):
@@ -986,6 +1064,7 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
         self.app.saved.listeners.append(self.on_bookmarks_changed)
         self.connect("destroy", lambda *_: self.on_bookmarks_changed in self.app.saved.listeners
                      and self.app.saved.listeners.remove(self.on_bookmarks_changed))
+        self._typed_t = 0
         self._toast_t = 0
         self.vertical = None
         self.layout(app.prefs.data.get("vertical_tabs", True))
@@ -1222,7 +1301,7 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
         self.url = Gtk.Entry(hexpand=True, placeholder_text="Search or enter an address")
         self.url.get_style_context().add_class("sh-url")
         self.url.connect("activate", self.on_url_activate)
-        self.url.connect("changed", lambda *_: self.url.has_focus() and setattr(self, "editing", True))
+        self.url.connect("changed", self.on_url_changed)
         self.url.connect("focus-in-event", self.on_url_focus)
         self.url.connect("focus-out-event", lambda *_: (setattr(self, "editing", False), self.show_uri(),
                                                          self.later_hide("top", 300))[0] and False)
@@ -1329,6 +1408,12 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
             c.connect("toggled", self.on_list_toggle, k)
             self.sh_checks[k] = c
             box.pack_start(c, False, False, 0)
+        self.sh_everywhere = Gtk.CheckButton(label="Also hide leftover ad spaces on every site (slower)")
+        self.sh_everywhere.set_tooltip_text(
+            "Ads are blocked either way. This adds the lists' ~40,000 hiding rules meant for any site, "
+            "which every page then has to check: pages show up about a second later on this machine.")
+        self.sh_everywhere.connect("toggled", self.on_everywhere_toggle)
+        box.pack_start(self.sh_everywhere, False, False, 0)
         self.sh_status = Gtk.Label(xalign=0, wrap=True, max_width_chars=40)
         self.sh_status.get_style_context().add_class("dim-label")
         box.pack_start(self.sh_status, False, False, 0)
@@ -1347,6 +1432,8 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
         for k, c in self.sh_checks.items():
             c.set_active(k in wanted)
             c.set_sensitive(not b.busy)
+        self.sh_everywhere.set_active(b.hide_everywhere)
+        self.sh_everywhere.set_sensitive(not b.busy and bool(wanted))
         self._shield_busy = False
         host = site_of(host_of(self.view.get_uri() if self.view else ""))
         if host and b.enabled:
@@ -1378,6 +1465,13 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
         self.app.prefs.data["allow"] = allow
         self.app.prefs.changed()
         self.app.refilter(reload_current=self)
+
+    def on_everywhere_toggle(self, c):
+        if getattr(self, "_shield_busy", False):
+            return
+        self.app.prefs.data["hide_everywhere"] = c.get_active()
+        self.app.prefs.changed()
+        self.app.blocker.update()
 
     def on_list_toggle(self, c, key):
         if getattr(self, "_shield_busy", False):
@@ -1485,8 +1579,7 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
             tab.label.set_text(tab.title)
             tab.head.set_tooltip_text(tab.title)
         elif uri:
-            app.blocker.apply_to(ucm, uri)
-            view.load_uri(uri)
+            self.start_load(view, uri)
         if not background or self.current is None:
             self.notebook.set_current_page(self.notebook.page_num(tab.slot))
             if uri == HOME_URI:
@@ -1526,8 +1619,14 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
 
     def load_pending(self, tab):
         uri, tab.pending = tab.pending, None
-        self.app.blocker.apply_to(tab.view.get_user_content_manager(), uri)
-        tab.view.load_uri(uri)
+        self.start_load(tab.view, uri)
+
+    def start_load(self, view, uri):
+        """Load uri in view with the ad blocker's filter in place."""
+        def go():
+            self.app.blocker.apply_to(view.get_user_content_manager(), uri)
+            view.load_uri(uri)
+        self.app.blocker.when_ready(uri, go)
 
     def close_tab(self, tab):
         if tab not in self.tabs:
@@ -1538,6 +1637,9 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
             self.app.closed_any = (self, self.closed)
         self.tabs.remove(tab)
         tab.shown()  # drops a pending sleep check
+        if tab.hover_t:
+            GLib.source_remove(tab.hover_t)
+            tab.hover_t = 0
         if len(self.tabs) == 0:
             self.save_session(final=True)
             self.destroy()
@@ -1907,6 +2009,7 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
     # -- address bar
     def on_url_focus(self, *_):
         GLib.idle_add(lambda: self.url.select_region(0, -1) and False)
+        self.warm(self.app.resolve("search"))  # the search engine: the most likely next stop
         return False
 
     def match_history(self, comp, key, it, _data):
@@ -1923,6 +2026,25 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
         self.go(model[it][0])
         return True
 
+    def on_url_changed(self, *_):
+        if not self.url.has_focus():
+            return
+        self.editing = True
+        # look up the address being typed (or the search engine) before Enter is pressed
+        if self._typed_t:
+            GLib.source_remove(self._typed_t)
+        def lookup():
+            self._typed_t = 0
+            self.warm(self.app.resolve(self.url.get_text()))
+            return False
+        self._typed_t = GLib.timeout_add(150, lookup)
+
+    def warm(self, uri):
+        if self.current:
+            self.current.preconnect(uri)
+        else:
+            self.app.prefetch(uri, self.private)
+
     def on_url_activate(self, *_):
         self.go(self.url.get_text())
 
@@ -1932,8 +2054,7 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
         if not self.view:
             self.new_tab(uri)
         else:
-            self.app.blocker.apply_to(self.view.get_user_content_manager(), uri)
-            self.view.load_uri(uri)
+            self.start_load(self.view, uri)
             self.view.grab_focus()
         self.show_uri()
 
@@ -2316,6 +2437,7 @@ class App(Gtk.Application):
         self.saved.listeners.append(lambda: self.history.soon())
         self.history = History(self.saved)
         self.downloads = Downloads(self)
+        self._prefetched = {}
         self.settings = WebKit2.Settings(
             enable_developer_extras=True, enable_back_forward_navigation_gestures=True,
             enable_media_stream=True, enable_webrtc=True, enable_smooth_scrolling=True,
@@ -2621,6 +2743,21 @@ class App(Gtk.Application):
         return False
 
     # -- addresses
+    def prefetch(self, uri, private=False):
+        """Look up a host's address ahead of a likely visit (a hovered link, the address being
+        typed), so the DNS round trip is out of the way when it is opened. A lookup sends the
+        name to the resolver early and nothing to the site itself."""
+        host = host_of(uri) if is_web(uri) else ""
+        if not host or "." not in host:
+            return
+        now = time.monotonic()
+        if now - self._prefetched.get(host, -999) < 60:
+            return
+        if len(self._prefetched) > 500:
+            self._prefetched.clear()
+        self._prefetched[host] = now
+        self.context_for(private).prefetch_dns(host)
+
     def resolve(self, text):
         t = (text or "").strip()
         if not t:

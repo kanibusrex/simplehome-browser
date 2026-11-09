@@ -80,6 +80,16 @@ class Filters(unittest.TestCase):
         self.assertNotIn("div", by_sel)  # bare element selectors are too broad for every site
         self.assertEqual(len(hide), 2)
 
+    def test_every_site_hiding_can_be_left_out(self):
+        text = "||ads.com^\n##.ad\n##.banner\nexample.com##.promo\nexample.com#@#.ad"
+        rules, stats = adblock.build([text], generic_hide=False)
+        hide = [r for r in rules if r["action"]["type"] == "css-display-none"]
+        self.assertEqual([r["action"]["selector"] for r in hide], [".promo"])  # per-site hiding stays
+        self.assertTrue(all("if-domain" in r["trigger"] for r in hide))
+        self.assertTrue(any(r["action"]["type"] == "block" for r in rules))  # blocking is untouched
+        self.assertEqual(stats["generic_left_out"], 2)
+        self.assertEqual(adblock.build([text])[1]["generic_left_out"], 0)
+
     def test_allowlist_comes_last(self):
         rules = adblock.build(["||bad.com^\n##.ad"], allowlist=["mine.com"])[0]
         self.assertEqual(rules[-1]["trigger"]["if-domain"], ["*mine.com"])
