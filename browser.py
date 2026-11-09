@@ -31,7 +31,7 @@ import mpvplay  # noqa: E402
 import onscreen  # noqa: E402
 import passwords  # noqa: E402
 
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 APP_ID = "dev.simplehome.Browser"
 NAME = "SimpleHome Browser"
 DESKTOP_ID = "simplehome-browser.desktop"
@@ -396,6 +396,9 @@ class Blocker:
             except (GLib.Error, ValueError):
                 bad = set()
             log("invalid selectors", len(bad))
+            # destroy() alone left its page process running (~140 MB) until the browser quit
+            self._check_view = v._keep = None
+            v.terminate_web_process()
             v.destroy()
             threading.Thread(target=self._compile, args=(rules, bad, keys, failed), daemon=True).start()
 
