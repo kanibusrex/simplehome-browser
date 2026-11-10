@@ -31,7 +31,7 @@ import mpvplay  # noqa: E402
 import onscreen  # noqa: E402
 import passwords  # noqa: E402
 
-VERSION = "1.10.0"
+VERSION = "1.11.0"
 APP_ID = "dev.simplehome.Browser"
 NAME = "SimpleHome Browser"
 DESKTOP_ID = "simplehome-browser.desktop"
@@ -53,6 +53,7 @@ SLEEP_CHOICES = [(SLEEP_NOW, "Right away"), (5, "After 5 minutes"), (10, "After 
 # "Right away" still gives a tab you just left a few seconds, so glancing back at it (or Ctrl+Tab
 # going past it) doesn't reload the page each time
 SLEEP_GRACE = int(os.environ.get("SIMPLEHOME_SLEEP_GRACE", "10"))
+PIN_LOAD_DELAY = float(os.environ.get("SIMPLEHOME_PIN_DELAY", "3"))  # s after the window opens before pinned tabs load
 # a background tab using at least BUSY_CPU of a core for BUSY_SAMPLES checks in a row (30 s each)
 # goes to sleep then, without waiting out the sleep timer
 BUSY_CPU = 0.10
@@ -583,6 +584,7 @@ def theme_css(p, private=False):
 .sh-tabs.sh-side > header {{ box-shadow: inset -1px 0 @sh_border; }}
 .sh-tabs.sh-side > header tab {{ border-radius: 8px; }}
 .sh-asleep {{ opacity: 0.55; }}
+.sh-pin {{ color: @sh_muted; opacity: 0.8; }}
 .sh-tabs.sh-side > header tab:checked {{ box-shadow: inset 3px 0 @sh_acc; }}
 .sh-newtab, .sh-newtab label {{ color: @sh_muted; }}
 .sh-savebar {{ background: @sh_surface; color: @sh_fg; box-shadow: inset 0 -1px @sh_border; }}
@@ -630,6 +632,7 @@ class Tab:
         self.shares_process = False  # opened with or by window.open: one process for both tabs
         self.hidden_since = time.time()
         self.sleep_timer = 0  # "Right away": the one-shot check after the tab goes out of sight
+        self.pinned = False  # kept at the top of the tabs, never put to sleep, back at every launch
         self.pid = None  # the page's process, reported by the web extension
         self.cpu_mark = None  # (ticks, time) at the last check
         self.busy = 0  # checks in a row this tab used the CPU while hidden
@@ -650,14 +653,19 @@ class Tab:
         close.set_relief(Gtk.ReliefStyle.NONE)
         close.set_tooltip_text("Close tab (Ctrl+W)")
         close.connect("clicked", lambda *_: win.close_tab(self))
+        self.close_btn = close
+        self.pin_icon = Gtk.Image.new_from_icon_name("view-pin-symbolic", Gtk.IconSize.MENU)
+        self.pin_icon.get_style_context().add_class("sh-pin")
         box = Gtk.Box(spacing=6)
         box.pack_start(self.lead, False, False, 0)
         box.pack_start(self.label, True, True, 0)
+        box.pack_start(self.pin_icon, False, False, 0)
         box.pack_start(close, False, False, 0)
         self.head = Gtk.EventBox()
         self.head.add(box)
         self.head.connect("button-press-event", self.on_head_press)
         self.head.show_all()
+        self.pin_icon.hide()
         self.slot.show()
         view.show()
 
@@ -695,12 +703,51 @@ class Tab:
         # a side column is as wide as its widest tab, so every tab gets the same fixed width there
         self.label.set_width_chars(22 if vertical else 16)
         self.label.set_max_width_chars(22)
+        self.vertical = vertical
+        if hasattr(self, "close_btn"):
+            self.show_pinned()
+
+    def set_pinned(self, on):
+        self.pinned = bool(on)
+        self.show_pinned()
+        if self.pinned:
+            self.shown()  # drops a pending sleep check
+            if self.asleep and self is not self.win.current:
+                self.wake()  # pinned means loaded: have it ready for when you come back
+
+    def show_pinned(self):
+        """A pinned tab shows a pin where the close button was; in a row of tabs on top it's
+        just its icon, as in other browsers."""
+        on = self.pinned
+        self.pin_icon.set_visible(on)
+        self.close_btn.set_visible(not on)
+        self.label.set_visible(not on or self.vertical)
+        sc = self.head.get_style_context()
+        (sc.add_class if on else sc.remove_class)("sh-pinned")
+        self.head.set_tooltip_text(self.title + (" (pinned)" if on else ""))
 
     def on_head_press(self, w, ev):
-        if ev.button == 2:
+        if ev.button == 2 and not self.pinned:  # a pinned tab doesn't close by a stray click
             self.win.close_tab(self)
             return True
+        if ev.button == 3 and ev.type == Gdk.EventType.BUTTON_PRESS:
+            self.head_menu(ev)
+            return True
         return False
+
+    def head_menu(self, ev):
+        m = Gtk.Menu()
+        def item(label, cb):
+            it = Gtk.MenuItem.new_with_mnemonic(label)
+            it.connect("activate", lambda *_: cb())
+            m.append(it)
+        item("Unpin Tab" if self.pinned else "_Pin Tab", lambda: self.win.pin_tab(self, not self.pinned))
+        item("_Reload Tab", lambda: self.wake() if self.asleep else self.view.reload())
+        m.append(Gtk.SeparatorMenuItem())
+        item("_Close Tab", lambda: self.win.close_tab(self))
+        m.attach_to_widget(self.head, None)
+        m.show_all()
+        m.popup_at_pointer(ev)
 
     def on_title(self, *_):
         t = self.view.get_title() or ""
@@ -708,7 +755,7 @@ class Tab:
             t = "New tab"
         self.title = t or self.display_uri() or "New tab"
         self.label.set_text(self.title)
-        self.head.set_tooltip_text(self.title)
+        self.head.set_tooltip_text(self.title + (" (pinned)" if self.pinned else ""))
         if not self.private:
             self.win.app.history.set_title(self.uri, t)
         self.win.tab_changed(self)
@@ -904,7 +951,7 @@ class Tab:
         return True
 
     def can_sleep(self, minutes):
-        if self.asleep or self.pending or self.shares_process or self is self.win.current:
+        if self.pinned or self.asleep or self.pending or self.shares_process or self is self.win.current:
             return False
         if not (is_web(self.uri) or self.uri.startswith(HOME_URI)) or self.view.is_playing_audio():
             return False
@@ -1021,7 +1068,7 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
         self.notebook.get_style_context().add_class("sh-tabs")
         self.notebook.set_vexpand(False)
         self.notebook.connect("switch-page", self.on_switch)
-        self.notebook.connect("page-reordered", lambda *_: self.save_session())
+        self.notebook.connect("page-reordered", lambda *_: self.keep_pins_first() or self.save_session())
         # "+" sits after the tabs in a row, and at the top of the column when tabs are on the side
         self.add_btns = {}
         for pack in (Gtk.PackType.START, Gtk.PackType.END):
@@ -1555,7 +1602,7 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
     def view(self):
         return self.current.view if self.current else None
 
-    def new_tab(self, uri=HOME_URI, related=None, background=False, index=None, lazy=False):
+    def new_tab(self, uri=HOME_URI, related=None, background=False, index=None, lazy=False, pinned=False):
         app = self.app
         ucm = WebKit2.UserContentManager()
         if related is not None:
@@ -1569,6 +1616,11 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
         self.stack.add(view)
         if index is None:
             index = self.notebook.page_num(self.current.slot) + 1 if self.current else -1
+        if pinned:
+            tab.set_pinned(True)
+            index = self.n_pinned()
+        elif index != -1:
+            index = max(index, self.n_pinned())
         self.notebook.insert_page(tab.slot, tab.head, index)
         self.notebook.set_tab_reorderable(tab.slot, True)
         if uri and lazy:
@@ -1602,6 +1654,7 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
             self.current.hidden()
         self.current = tab
         tab.shown()
+        self.app.sync_pin_action(self)
         self.stack.set_visible_child(tab.view)
         tab.wake()
         if hasattr(self, "_in") and self.vertical and not self._in["side"] and not getattr(self, "restoring", False):
@@ -1632,7 +1685,7 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
         if tab not in self.tabs:
             return
         if not self.private and tab.uri and not tab.uri.startswith(HOME_URI):
-            self.closed.append((tab.uri, self.notebook.page_num(tab.slot)))
+            self.closed.append((tab.uri, self.notebook.page_num(tab.slot), tab.pinned))
             self.closed = self.closed[-25:]
             self.app.closed_any = (self, self.closed)
         self.tabs.remove(tab)
@@ -1651,8 +1704,8 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
 
     def reopen_closed(self):
         if self.closed:
-            uri, idx = self.closed.pop()
-            self.new_tab(uri, index=min(idx, self.notebook.get_n_pages()))
+            uri, idx, pinned = self.closed.pop()
+            self.new_tab(uri, index=min(idx, self.notebook.get_n_pages()), pinned=pinned)
 
     def cycle(self, d):
         n = self.notebook.get_n_pages()
@@ -1662,10 +1715,48 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
     def move_tab(self, d):
         if not self.current:
             return
-        n = self.notebook.get_n_pages()
+        n, k = self.notebook.get_n_pages(), self.n_pinned()
+        lo, hi = (0, k - 1) if self.current.pinned else (k, n - 1)  # each stays in its own group
         i = self.notebook.page_num(self.current.slot)
-        self.notebook.reorder_child(self.current.slot, max(0, min(n - 1, i + d)))
+        self.notebook.reorder_child(self.current.slot, max(lo, min(hi, i + d)))
         self.save_session()
+
+    # -- pinned tabs
+    def n_pinned(self):
+        return sum(1 for t in self.tabs if t.pinned and self.notebook.page_num(t.slot) >= 0)
+
+    def pin_tab(self, tab, on):
+        if tab.pinned == bool(on):
+            return
+        tab.set_pinned(on)
+        # pinned ones go to the end of the pinned group; unpinned, to just after it
+        k = self.n_pinned()
+        self.notebook.reorder_child(tab.slot, k - 1 if on else k)
+        self.app.sync_pin_action(self)
+        self.save_session()
+        self.toast(f"Pinned: {tab.title} stays loaded and opens with the browser" if on else f"Unpinned {tab.title}")
+
+    def keep_pins_first(self):
+        """After a tab is dragged: pinned tabs stay together at the top, in the order they're in."""
+        order = [self.tab_at(i) for i in range(self.notebook.get_n_pages())]
+        want = [t for t in order if t and t.pinned] + [t for t in order if t and not t.pinned]
+        if want != order:
+            for i, t in enumerate(want):
+                self.notebook.reorder_child(t.slot, i)
+
+    def load_pins_soon(self):
+        """Pinned tabs from the last session load in the background a few seconds after the window
+        opens (or once the page in front has loaded), so they're ready but don't slow the start."""
+        start = time.time()
+        def go():
+            if self.current and self.current.view.is_loading() and time.time() - start < PIN_LOAD_DELAY + 12:
+                return True
+            for t in self.tabs:
+                if t.pinned and t.pending:
+                    self.load_pending(t)
+                    t.hidden_since = time.time()
+            return False
+        GLib.timeout_add(int(PIN_LOAD_DELAY * 1000), go)
 
     def tab_changed(self, tab, uri=False, load=False, progress=False):
         if tab is not self.current:
@@ -2263,12 +2354,20 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
         self.app.save_session(self, final)
 
     def session(self):
-        uris = []
+        """The window's ordinary tabs; pinned ones are saved apart (App.pins), since they come
+        back even when the last session's tabs don't."""
+        uris, active = [], 0
         for i in range(self.notebook.get_n_pages()):
             t = self.tab_at(i)
-            if t:
+            if t and not t.pinned:
+                if t is self.current:
+                    active = len(uris)
                 uris.append(t.uri or HOME_URI)
-        return {"tabs": uris, "active": max(0, self.notebook.get_current_page())}
+        return {"tabs": uris, "active": active}
+
+    def pins(self):
+        return [t.uri for t in (self.tab_at(i) for i in range(self.notebook.get_n_pages()))
+                if t and t.pinned and t.uri]
 
     def on_delete(self, *_):
         self.save_session(final=True)
@@ -2422,6 +2521,7 @@ class App(Gtk.Application):
         self.prefs = None
         self.closed_any = None
         self.last_normal = None
+        self.pins_placed = False  # the saved pinned tabs have gone into a window this run
         self._contexts = {}
         GLib.set_application_name(NAME)
 
@@ -2566,6 +2666,10 @@ class App(Gtk.Application):
         restore = Gio.SimpleAction.new_stateful("restore", None, GLib.Variant("b", self.prefs.data.get("restore", True)))
         restore.connect("activate", self.on_restore)
         self.add_action(restore)
+        self.pin_action = Gio.SimpleAction.new_stateful("pin-tab", None, GLib.Variant("b", False))
+        self.pin_action.connect("activate", lambda *_: win() and win().current
+                                and win().pin_tab(win().current, not win().current.pinned))
+        self.add_action(self.pin_action)
 
         m = Gio.Menu()
         s1 = Gio.Menu()
@@ -2573,6 +2677,7 @@ class App(Gtk.Application):
         s1.append("New window\tCtrl+N", "app.new-window")
         s1.append("New private window\tCtrl+Shift+N", "app.private-window")
         s1.append("Reopen closed tab\tCtrl+Shift+T", "app.reopen")
+        s1.append("Pin this tab", "app.pin-tab")
         m.append_section(None, s1)
         s2 = Gio.Menu()
         s2.append("Bookmark this page\tCtrl+D", "app.bookmark")
@@ -2827,22 +2932,39 @@ class App(Gtk.Application):
     def focused(self, w):
         if not w.private:
             self.last_normal = w
+        self.sync_pin_action(w)
+
+    def sync_pin_action(self, w):
+        """The menu's "Pin this tab" tick follows the tab in front of the window in use."""
+        if hasattr(self, "pin_action") and (w.is_active() or len(self.windows()) <= 1):
+            self.pin_action.set_state(GLib.Variant("b", bool(w.current and w.current.pinned)))
 
     def new_window(self, uris=None, private=False, restore=None):
         w = Window(self, private=private)
+        pins = []
+        if not private and not self.pins_placed:
+            # pinned tabs come back at every launch, in the first ordinary window
+            self.pins_placed = True
+            pins = [u for u in self.prefs.data.get("pinned", []) if isinstance(u, str) and u]
+            w.restoring = True
+            for u in pins:
+                w.new_tab(u, background=True, lazy=True, pinned=True)
+            w.restoring = False
         if restore:
             w.restoring = True
             for u in restore.get("tabs", []):
                 w.new_tab(u, background=True, lazy=True)
-            if w.tabs:
-                w.notebook.set_current_page(min(restore.get("active", 0), len(w.tabs) - 1))
+            if len(w.tabs) > len(pins):
+                w.notebook.set_current_page(len(pins) + min(restore.get("active", 0), len(w.tabs) - len(pins) - 1))
             w.restoring = False
-            if w.current and w.current.pending:
+            if w.current and w.current.pending and not w.current.pinned:
                 w.load_pending(w.current)
         for u in uris or []:
             w.new_tab(self.resolve(u))
-        if not w.tabs:
-            w.new_tab()
+        if len(w.tabs) == len(pins):
+            w.new_tab()  # a fresh start shows a new tab in front, with the pinned ones above it
+        if pins:
+            w.load_pins_soon()
         w.present()
         return w
 
@@ -2851,15 +2973,21 @@ class App(Gtk.Application):
             return
         open_wins = [w for w in self.windows() if not w.private and w.tabs and (w is not win or not final)]
         if final and not open_wins:
-            sess = [win.session()] if win.tabs else []  # the last window closing: keep it for next time
+            wins = [win] if win.tabs else []  # the last window closing: keep it for next time
         else:
-            sess = [w.session() for w in open_wins]
-        self.prefs.data["session"] = sess
+            wins = open_wins
+        self.prefs.data["session"] = [w.session() for w in wins]
+        self.save_pins(wins)
         self.prefs.changed()
 
+    def save_pins(self, wins):
+        if self.pins_placed:  # until then the saved ones are still waiting for a window
+            self.prefs.data["pinned"] = [u for w in wins for u in w.pins()]
+
     def quit_all(self):
-        normal = [w for w in self.windows() if not w.private]
-        self.prefs.data["session"] = [w.session() for w in normal if w.tabs]
+        normal = [w for w in self.windows() if not w.private and w.tabs]
+        self.prefs.data["session"] = [w.session() for w in normal]
+        self.save_pins(normal)
         self.prefs.flush()
         self.history.store.flush()
         self.quit()
