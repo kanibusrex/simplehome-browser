@@ -30,8 +30,9 @@ import bookmarks  # noqa: E402
 import mpvplay  # noqa: E402
 import onscreen  # noqa: E402
 import passwords  # noqa: E402
+import popups  # noqa: E402
 
-VERSION = "1.11.0"
+VERSION = "1.11.1"
 APP_ID = "dev.simplehome.Browser"
 NAME = "SimpleHome Browser"
 DESKTOP_ID = "simplehome-browser.desktop"
@@ -739,7 +740,9 @@ class Tab:
         m = Gtk.Menu()
         def item(label, cb):
             it = Gtk.MenuItem.new_with_mnemonic(label)
-            it.connect("activate", lambda *_: cb())
+            # run once the menu has finished closing: Close Tab on the last tab closes the window,
+            # and doing that under a menu that's still going away is how GTK 3 crashes (see popups.py)
+            it.connect("activate", lambda *_: GLib.idle_add(lambda: cb() and False))
             m.append(it)
         item("Unpin Tab" if self.pinned else "_Pin Tab", lambda: self.win.pin_tab(self, not self.pinned))
         item("_Reload Tab", lambda: self.wake() if self.asleep else self.view.reload())
@@ -1054,6 +1057,7 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
         self.app = app
         self.private = private
         self.tabs = []
+        self.closing = False
         self.closed = []
         self.current = None
         self.editing = False
@@ -1695,12 +1699,24 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
             tab.hover_t = 0
         if len(self.tabs) == 0:
             self.save_session(final=True)
-            self.destroy()
+            self.close_soon()
             return
+        popups.dismiss(self)  # one could be anchored inside the tab's page or tab button (see popups.py)
         self.notebook.remove_page(self.notebook.page_num(tab.slot))
         self.stack.remove(tab.view)
         tab.view.destroy()
         self.save_session()
+
+    def close_soon(self):
+        """Close this window without a pop-up left showing on it (see popups.py). It goes out of
+        sight now and is destroyed when the main loop next comes round, so a menu whose item
+        led here has finished closing first."""
+        if self.closing:
+            return
+        self.closing = True
+        popups.dismiss(self)
+        self.hide()
+        GLib.idle_add(lambda: self.destroy() and False)
 
     def reopen_closed(self):
         if self.closed:
@@ -2371,6 +2387,7 @@ class Window(Gtk.ApplicationWindow, passwords.PasswordUI):
 
     def on_delete(self, *_):
         self.save_session(final=True)
+        popups.dismiss(self)  # GTK destroys the window right after this (see popups.py)
         return False
 
 
@@ -2990,6 +3007,8 @@ class App(Gtk.Application):
         self.save_pins(normal)
         self.prefs.flush()
         self.history.store.flush()
+        for w in self.windows():
+            popups.dismiss(w)
         self.quit()
 
     def do_command_line(self, cmd):
