@@ -32,7 +32,7 @@ import onscreen  # noqa: E402
 import passwords  # noqa: E402
 import popups  # noqa: E402
 
-VERSION = "1.11.1"
+VERSION = "1.11.2"
 APP_ID = "dev.simplehome.Browser"
 NAME = "SimpleHome Browser"
 DESKTOP_ID = "simplehome-browser.desktop"
@@ -662,7 +662,10 @@ class Tab:
         box.pack_start(self.label, True, True, 0)
         box.pack_start(self.pin_icon, False, False, 0)
         box.pack_start(close, False, False, 0)
-        self.head = Gtk.EventBox()
+        # no window of its own: GtkNotebook "ends a tab drag" whenever anything grabs the pointer
+        # (any menu opening), and for a tab label with its own window that means unrealizing it,
+        # so the front tab's header window was destroyed under the menu just opened on it -> SEGV
+        self.head = Gtk.EventBox(visible_window=False)
         self.head.add(box)
         self.head.connect("button-press-event", self.on_head_press)
         self.head.show_all()
@@ -737,6 +740,8 @@ class Tab:
         return False
 
     def head_menu(self, ev):
+        if getattr(self, "head_pop", None):
+            self.head_pop.destroy()  # the last one, long closed (attached menus otherwise pile up)
         m = Gtk.Menu()
         def item(label, cb):
             it = Gtk.MenuItem.new_with_mnemonic(label)
@@ -750,7 +755,14 @@ class Tab:
         item("_Close Tab", lambda: self.win.close_tab(self))
         m.attach_to_widget(self.head, None)
         m.show_all()
-        m.popup_at_pointer(ev)
+        # anchored to the window itself, which outlives the menu, rather than to the window the
+        # click landed in (popup_at_pointer keeps a plain pointer to that one; see popups.py)
+        top = self.win.get_window()
+        _, x, y, _ = top.get_device_position(ev.get_device() or Gdk.Display.get_default().get_default_seat().get_pointer())
+        rect = Gdk.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = x, y, 1, 1
+        m.popup_at_rect(top, rect, Gdk.Gravity.NORTH_WEST, Gdk.Gravity.NORTH_WEST, ev)
+        self.head_pop = m
 
     def on_title(self, *_):
         t = self.view.get_title() or ""
